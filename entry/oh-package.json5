@@ -1,0 +1,13 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "Please describe the basic information.",
+  "main": "",
+  "author": "",
+  "license": "",
+  "dependencies": {
+    "@av/xrtc": "file:../libs/xrtc.har",
+    "@shengwang/rtc-full": "file:../libs/AgoraRtcSdk-4.4.2-0.97.har"
+  }
+}
+

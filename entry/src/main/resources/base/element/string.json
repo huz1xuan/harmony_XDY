@@ -1,0 +1,32 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "module description"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "description"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "label"
+    },
+    {
+      "name": "camera_reason",
+      "value": "用于视频通话，采集摄像头画面"
+    },
+    {
+      "name": "microphone_reason",
+      "value": "用于语音通话，采集麦克风音频"
+    },
+    {
+      "name": "read_media_reason",
+      "value": "用于读取媒体文件，访问相册和文件"
+    },
+    {
+      "name": "write_media_reason",
+      "value": "用于保存媒体文件，保存照片和视频"
+    }
+  ]
+}
