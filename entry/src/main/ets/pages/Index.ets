@@ -187,6 +187,9 @@ struct XdyClassPage {
         .domStorageAccess(true)
         .fileAccess(true)
         .mixedMode(MixedMode.All)
+        .onPermissionRequest((event) => {
+          if (event && event.request) { event.request.grant(event.request.getAccessibleResource()); }
+        })
         .backgroundColor(Color.Black)
       // 视频浮层（XComponent叠加在WebView上）
       Stack({ alignContent: Alignment.TopStart }) {
@@ -364,25 +367,25 @@ struct XdyClassPage {
       const mi = this.memberMap.get(uid);
       if (mi) { mi.videoMuted = mute; this.memberMap.set(uid, mi); }
       this.playerViews = this.playerViews.map((pv: PlayerViewInfo) =>
-        pv.userId === uid ? {
-          vid: pv.vid,
-          userId: pv.userId,
-          userRole: pv.userRole,
-          userName: pv.userName,
-          isPlaying: pv.isPlaying,
-          surfaceId: pv.surfaceId,
-          audioMuted: pv.audioMuted,
-          videoMuted: mute,
-          channelId: pv.channelId,
-          left: pv.left,
-          top: pv.top,
-          width: pv.width,
-          height: pv.height,
-          radius: pv.radius,
-          visible: pv.visible,
-          volumeBtn: pv.volumeBtn,
-          zoomBtn: pv.zoomBtn
-        } : pv);
+      pv.userId === uid ? {
+        vid: pv.vid,
+        userId: pv.userId,
+        userRole: pv.userRole,
+        userName: pv.userName,
+        isPlaying: pv.isPlaying,
+        surfaceId: pv.surfaceId,
+        audioMuted: pv.audioMuted,
+        videoMuted: mute,
+        channelId: pv.channelId,
+        left: pv.left,
+        top: pv.top,
+        width: pv.width,
+        height: pv.height,
+        radius: pv.radius,
+        visible: pv.visible,
+        volumeBtn: pv.volumeBtn,
+        zoomBtn: pv.zoomBtn
+      } : pv);
     } catch (e) {
       console.error('[XDY] handleMuteVideo err: ' + (e instanceof Error ? e.message : String(e)));
     }
@@ -407,25 +410,25 @@ struct XdyClassPage {
       const mi = this.memberMap.get(uid);
       if (mi) { mi.audioMuted = mute; this.memberMap.set(uid, mi); }
       this.playerViews = this.playerViews.map((pv: PlayerViewInfo) =>
-        pv.userId === uid ? {
-          vid: pv.vid,
-          userId: pv.userId,
-          userRole: pv.userRole,
-          userName: pv.userName,
-          isPlaying: pv.isPlaying,
-          surfaceId: pv.surfaceId,
-          audioMuted: mute,
-          videoMuted: pv.videoMuted,
-          channelId: pv.channelId,
-          left: pv.left,
-          top: pv.top,
-          width: pv.width,
-          height: pv.height,
-          radius: pv.radius,
-          visible: pv.visible,
-          volumeBtn: pv.volumeBtn,
-          zoomBtn: pv.zoomBtn
-        } : pv);
+      pv.userId === uid ? {
+        vid: pv.vid,
+        userId: pv.userId,
+        userRole: pv.userRole,
+        userName: pv.userName,
+        isPlaying: pv.isPlaying,
+        surfaceId: pv.surfaceId,
+        audioMuted: mute,
+        videoMuted: pv.videoMuted,
+        channelId: pv.channelId,
+        left: pv.left,
+        top: pv.top,
+        width: pv.width,
+        height: pv.height,
+        radius: pv.radius,
+        visible: pv.visible,
+        volumeBtn: pv.volumeBtn,
+        zoomBtn: pv.zoomBtn
+      } : pv);
     } catch (e) {
       console.error('[XDY] handleMuteAudio err: ' + (e instanceof Error ? e.message : String(e)));
     }
@@ -572,13 +575,14 @@ struct XdyClassPage {
       if (this.rtcEngine) {
         const up: UserParam = new UserParam(uid);
         if (uid === this.selfUid) {
+          this.rtcEngine.enableLocalVideo(video);
           this.rtcEngine.setLocalVideo(surfaceId, true, RenderMode.RENDER_MODE_HIDDEN, up);
           this.rtcEngine.muteLocalVideoStream(!video);
           this.rtcEngine.muteLocalAudioStream(!audio);
           const setupCode: number = video ? 0 : -1;
           this.native2Js('2005', setupCode >= 0 ? 0 : 1, '推流开音视频',
             '{"uid":' + uid + ',"video":' + (video ? 'true' : 'false') +
-            ',"audio":' + (audio ? 'true' : 'false') + ',"setupVideo":' + setupCode + '}');
+              ',"audio":' + (audio ? 'true' : 'false') + ',"setupVideo":' + setupCode + '}');
         } else {
           this.rtcEngine.setRemoteVideo(surfaceId, true, RenderMode.RENDER_MODE_HIDDEN, up);
         }
@@ -604,6 +608,7 @@ struct XdyClassPage {
         if (pv.surfaceId && this.rtcEngine) {
           const up: UserParam = new UserParam(uid);
           if (uid === this.selfUid) {
+            this.rtcEngine.enableLocalVideo(false);
             this.rtcEngine.setLocalVideo(pv.surfaceId, false, RenderMode.RENDER_MODE_HIDDEN, up);
           } else {
             this.rtcEngine.setRemoteVideo(pv.surfaceId, false, RenderMode.RENDER_MODE_HIDDEN, up);
