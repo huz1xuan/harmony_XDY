@@ -134,6 +134,7 @@ struct XdyClassPage {
   private localAudioBytes: number = 0;
   private localVideoBytes: number = 0;
   private localStatsAudioReady: boolean = false;
+  private isExiting: boolean = false;
   private localStatsVideoReady: boolean = false;
   private localStats: LocalStatsObj = {
     uid: 0, audiosentSampleRate: 0, audioSendBytesNow: 0, audioSendBytes: 0,
@@ -197,6 +198,35 @@ struct XdyClassPage {
         .userAgent('Mozilla/5.0 (Linux; Android 10; HarmonyOS) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36 XdyAndroid/1.0')
         .onPermissionRequest((event) => {
           if (event && event.request) { event.request.grant(event.request.getAccessibleResource()); }
+        })
+        .onLoadIntercept((event) => {
+          if (!event) return false;
+          const url: string = event.data.getRequestUrl();
+          // 拦截管理后台跳转（H5退出时直接window.location.href，不经过type:1004消息）
+          // Android 端通过 shouldOverrideUrlLoading 关闭 Activity，我们在此拦截并重定向到登录页
+          if (url.indexOf('xdyui2.xuedianyun.com') >= 0) {
+            console.info('[XDY] 拦截管理页跳转: ' + url);
+            try {
+              webview.WebCookieManager.clearAllCookiesSync();
+              // 当前页面还在 pclive 域，可清除 pclive 的 localStorage
+              this.webviewCtrl.runJavaScript('try{localStorage.clear();sessionStorage.clear();}catch(e){}')
+                .then((_r: string) => {
+                  try {
+                    this.webviewCtrl.removeCache(true);
+                    this.webviewCtrl.loadUrl(this.homeUrl);
+                    console.info('[XDY] 已清除会话，重载登录页');
+                  } catch (e2) {
+                    console.warn('[XDY] loadUrl err: ' + String(e2));
+                  }
+                }).catch((_e: Error) => {
+                  try { this.webviewCtrl.loadUrl(this.homeUrl); } catch (_e2) {}
+                });
+            } catch (e) {
+              try { this.webviewCtrl.loadUrl(this.homeUrl); } catch (_e2) {}
+            }
+            return true; // 阻断跳转到管理页
+          }
+          return false;
         })
         .backgroundColor(Color.Black)
       // 视频浮层（XComponent叠加在WebView上）
@@ -343,7 +373,31 @@ struct XdyClassPage {
       console.warn('[XDY] handleLeaveChannel parse warn');
     }
     this.joinChanneled = false;
+    this.isExiting = true;
     this.handelWebLeaveChannel();
+    // 先通过 JS 清除 localStorage/sessionStorage（与 xdyclass 同域，可清除 session 状态）
+    // 再清 cookie + cache + 重载登录页
+    try {
+      webview.WebCookieManager.clearAllCookiesSync();
+      this.webviewCtrl.runJavaScript(
+        'try{localStorage.clear();sessionStorage.clear();}catch(e){}'
+      ).then((_r: string) => {
+        try {
+          this.webviewCtrl.removeCache(true);
+          this.webviewCtrl.loadUrl(this.homeUrl);
+          console.info('[XDY] 退出课堂，已清除 localStorage + cookie，重载登录页');
+        } catch (e2) {
+          console.warn('[XDY] loadUrl err: ' + (e2 instanceof Error ? e2.message : String(e2)));
+        }
+      }).catch((_e: Error) => {
+        try {
+          this.webviewCtrl.removeCache(true);
+          this.webviewCtrl.loadUrl(this.homeUrl);
+        } catch (e3) {}
+      });
+    } catch (e) {
+      console.warn('[XDY] exit redirect err: ' + (e instanceof Error ? e.message : String(e)));
+    }
   }
 
   // 1005 推流
@@ -463,20 +517,29 @@ struct XdyClassPage {
       const disp = display.getDefaultDisplaySync();
       const pw: number = disp.width;
       const ph: number = disp.height;
-      const dpi: number = disp.densityDPI;
+      // dpi 使用密度比率（Android 标准：densityDPI / 160），与 Android 端一致
+      const dpiRatio: number = disp.densityDPI / 160;
       const mw: number = Math.max(pw, ph);
       const mh: number = Math.min(pw, ph);
-      const info: string = '{"deviceSysName":"Android","deviceSysVersion":"10","deviceModelName":"HarmonyOS",' +
-        '"deviceWidth":' + mw + ',"deviceHeight":' + mh + ',"dpi":' + dpi + ',' +
-        '"systemMaxVolume":15,"systemCurrentVolume":10,"musicMaxVolume":15,"musicCurrentVolume":10,' +
-        '"appName":"学点云课堂","appVersion":"1.0.0","sdkVersion":"1.0.0","appBuild":1}';
+      const info: string = '{"rtcSdk":{"agoraRtc":"4.3.2.17"},' +
+        '"deviceSysName":"Android","deviceSysVersion":"10","deviceModelName":"HarmonyOS",' +
+        '"deviceWidth":' + mw + ',"deviceWidth1":' + mw + ',"deviceWidth2":' + mw +
+        ',"deviceWidth3":' + mw + ',"deviceWidth4":' + mw + ',"deviceWidth5":' + mw + ',' +
+        '"deviceHeight":' + mh + ',"deviceHeight1":' + mh + ',"deviceHeight2":' + mh +
+        ',"deviceHeight3":' + mh + ',"deviceHeight4":' + mh + ',"deviceHeight5":' + mh + ',' +
+        '"dpi":' + dpiRatio + ',' +
+        '"systemMaxVolume":7,"systemCurrentVolume":0,"musicMaxVolume":15,"musicCurrentVolume":2,' +
+        '"appName":"学点云课堂","appVersion":"v1.0.0","sdkVersion":"v1.0.0","appBuild":1}';
       this.native2Js('2010', 0, '设备信息', info);
     } catch (e) {
       this.native2Js('2010', 0, '设备信息',
-        '{"deviceSysName":"Android","deviceSysVersion":"10","deviceModelName":"HarmonyOS",' +
-        '"deviceWidth":1280,"deviceHeight":800,"dpi":240,' +
-        '"systemMaxVolume":15,"systemCurrentVolume":10,"musicMaxVolume":15,"musicCurrentVolume":10,' +
-        '"appName":"学点云课堂","appVersion":"1.0.0","sdkVersion":"1.0.0","appBuild":1}');
+        '{"rtcSdk":{"agoraRtc":"4.3.2.17"},' +
+        '"deviceSysName":"Android","deviceSysVersion":"10","deviceModelName":"HarmonyOS",' +
+        '"deviceWidth":1280,"deviceWidth1":1280,"deviceWidth2":1280,"deviceWidth3":1280,"deviceWidth4":1280,"deviceWidth5":1280,' +
+        '"deviceHeight":800,"deviceHeight1":800,"deviceHeight2":800,"deviceHeight3":800,"deviceHeight4":800,"deviceHeight5":800,' +
+        '"dpi":2.5,' +
+        '"systemMaxVolume":7,"systemCurrentVolume":0,"musicMaxVolume":15,"musicCurrentVolume":2,' +
+        '"appName":"学点云课堂","appVersion":"v1.0.0","sdkVersion":"v1.0.0","appBuild":1}');
     }
   }
 
