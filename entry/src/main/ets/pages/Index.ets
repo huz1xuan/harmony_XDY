@@ -128,7 +128,7 @@ struct XdyClassPage {
   private rtcHandler: XdyRtcHandler | null = null;
   private memberMap: Map<number, MemberInfo> = new Map();
   private rtcModelMap: Map<number, RtcModelInfo> = new Map();
-  private screenMaxDim: number = 360;
+  private screenWidth: number = 640;
   private videoDynamicSubscribe: boolean = false;
   // 本地统计累积
   private localAudioBytes: number = 0;
@@ -147,9 +147,9 @@ struct XdyClassPage {
     this.jsBridge.setHandler((msgId: string, val: string) => { this.onJs2Native(msgId, val); });
     try {
       const disp = display.getDefaultDisplaySync();
-      this.screenMaxDim = px2vp(Math.max(disp.width, disp.height));
+      this.screenWidth = px2vp(Math.max(disp.width, disp.height));
     } catch (e) {
-      this.screenMaxDim = 360;
+      this.screenWidth = 640;
     }
     // 申请权限
     try {
@@ -187,6 +187,14 @@ struct XdyClassPage {
         .domStorageAccess(true)
         .fileAccess(true)
         .mixedMode(MixedMode.All)
+        .overviewModeAccess(true)
+        .metaViewport(true)
+        .textZoomRatio(100)
+        .textAutosizing(false)
+        .zoomAccess(false)
+        .mediaPlayGestureAccess(false)
+        .cacheMode(CacheMode.None)
+        .userAgent('Mozilla/5.0 (Linux; Android 10; HarmonyOS) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36 XdyAndroid/1.0')
         .onPermissionRequest((event) => {
           if (event && event.request) { event.request.grant(event.request.getAccessibleResource()); }
         })
@@ -266,7 +274,7 @@ struct XdyClassPage {
 
   // 1000 WebView加载
   handleLoadWebView(): void {
-    this.native2Js('2000', 0, '加载webview', '{"os":"harmony"}');
+    this.native2Js('2000', 0, '加载webview', '{"os":"android"}');
   }
 
   // 1001 用户视图布局
@@ -274,7 +282,7 @@ struct XdyClassPage {
     try {
       const jo = JSON.parse(data) as ViewCellListData;
       const list: ViewCellData[] = jo.list ?? [];
-      const maxDim: number = this.screenMaxDim;
+      const sw: number = this.screenWidth;
       const newViews: PlayerViewInfo[] = [];
       for (const vc of list) {
         if (vc.userRole === 'showstage' || vc.userRole === 'invisible' || vc.userRole === 'zoom') {
@@ -285,11 +293,11 @@ struct XdyClassPage {
           userId: 0, userRole: vc.userRole, userName: '',
           isPlaying: false, surfaceId: '', audioMuted: false, videoMuted: false,
           channelId: '',
-          left: Math.ceil(maxDim * vc.left * 0.01),
-          top: Math.ceil(maxDim * vc.top * 0.01),
-          width: Math.ceil(maxDim * vc.width * 0.01),
-          height: Math.ceil(maxDim * vc.height * 0.01),
-          radius: Math.ceil(maxDim * vc.radius * 0.01),
+          left: Math.ceil(sw * vc.left * 0.01),
+          top: Math.ceil(sw * vc.top * 0.01),
+          width: Math.ceil(sw * vc.width * 0.01),
+          height: Math.ceil(sw * vc.height * 0.01),
+          radius: Math.ceil(sw * vc.radius * 0.01),
           visible: false, volumeBtn: vc.volumeBtn, zoomBtn: vc.zoomBtn,
         };
         newViews.push(pv);
@@ -446,12 +454,30 @@ struct XdyClassPage {
 
   // 1009 系统信息
   handleSysInfo(): void {
-    this.native2Js('2009', 0, '系统信息', '{"os":"harmony","platform":"HarmonyOS","volumeGain":100}');
+    this.native2Js('2009', 0, '系统信息', '{"memoryUsage":100,"memory":2048,"volumeGain":0}');
   }
 
   // 1010 设备信息
   handleDeviceInfo(): void {
-    this.native2Js('2010', 0, '设备信息', '{"os":"harmony","platform":"HarmonyOS"}');
+    try {
+      const disp = display.getDefaultDisplaySync();
+      const pw: number = disp.width;
+      const ph: number = disp.height;
+      const dpi: number = disp.densityDPI;
+      const mw: number = Math.max(pw, ph);
+      const mh: number = Math.min(pw, ph);
+      const info: string = '{"deviceSysName":"Android","deviceSysVersion":"10","deviceModelName":"HarmonyOS",' +
+        '"deviceWidth":' + mw + ',"deviceHeight":' + mh + ',"dpi":' + dpi + ',' +
+        '"systemMaxVolume":15,"systemCurrentVolume":10,"musicMaxVolume":15,"musicCurrentVolume":10,' +
+        '"appName":"学点云课堂","appVersion":"1.0.0","sdkVersion":"1.0.0","appBuild":1}';
+      this.native2Js('2010', 0, '设备信息', info);
+    } catch (e) {
+      this.native2Js('2010', 0, '设备信息',
+        '{"deviceSysName":"Android","deviceSysVersion":"10","deviceModelName":"HarmonyOS",' +
+        '"deviceWidth":1280,"deviceHeight":800,"dpi":240,' +
+        '"systemMaxVolume":15,"systemCurrentVolume":10,"musicMaxVolume":15,"musicCurrentVolume":10,' +
+        '"appName":"学点云课堂","appVersion":"1.0.0","sdkVersion":"1.0.0","appBuild":1}');
+    }
   }
 
   // 1015 切换摄像头
@@ -535,8 +561,8 @@ struct XdyClassPage {
       this.rtcEngine.leaveChannel();
       this.rtcEngine.destroy();
       this.rtcEngine = null;
-      this.native2Js('2004', 0, '本地退出频道', '{"uid":' + this.selfUid + ',"action":"退出课堂"}');
     }
+    this.native2Js('2004', 0, '本地退出频道', '{"uid":' + this.selfUid + ',"action":"退出课堂"}');
     this.reset();
   }
 

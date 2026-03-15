@@ -24,6 +24,8 @@ export default class EntryAbility extends UIAbility {
     windowStage.getMainWindow((err, win) => {
       if (!err.code) {
         win.setPreferredOrientation(window.Orientation.LANDSCAPE);
+        win.setWindowLayoutFullScreen(true);
+        win.setWindowSystemBarEnable([]);
       }
     });
 
