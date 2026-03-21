@@ -4,8 +4,17 @@ import { window } from '@kit.ArkUI';
 
 const DOMAIN = 0x0000;
 
+// 全局 Context，供 SDK 使用
+let globalContext: UIAbility | null = null;
+
+export function getGlobalContext(): UIAbility | null {
+  return globalContext;
+}
+
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
+    // 保存全局 Context
+    globalContext = this;
     try {
       this.context.getApplicationContext().setColorMode(ConfigurationConstant.ColorMode.COLOR_MODE_NOT_SET);
     } catch (err) {
@@ -15,6 +24,7 @@ export default class EntryAbility extends UIAbility {
   }
 
   onDestroy(): void {
+    globalContext = null;
     hilog.info(DOMAIN, 'testTag', '%{public}s', 'Ability onDestroy');
   }
 
