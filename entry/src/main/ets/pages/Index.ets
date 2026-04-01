@@ -117,15 +117,18 @@ class ChannelInitParams extends InitParams {
   private _rtcType: RtcType;
   private _domain: string;
   private _secretKey: string;
-  constructor(appId: string, rtcType: RtcType, domain: string, secretKey: string) {
+  private _context: common.UIAbilityContext | null;
+  constructor(appId: string, rtcType: RtcType, domain: string, secretKey: string, context: common.UIAbilityContext | null) {
     super();
     this._appId = appId; this._rtcType = rtcType;
     this._domain = domain; this._secretKey = secretKey;
+    this._context = context;
   }
   appId(): string { return this._appId; }
   rtcType(): RtcType { return this._rtcType; }
   domain(): string { return this._domain; }
   secretKey(): string { return this._secretKey; }
+  appContext(): common.UIAbilityContext | null { return this._context; }
 }
 
 // ===== RTC 事件处理器 =====
@@ -891,16 +894,13 @@ struct XdyClassPage {
     // Android端：刷新时不销毁RTC，直接复用
     // 只有在引擎不存在时才创建新引擎
     if (!this.rtcEngine) {
-      // 必须在创建引擎前设置 Context
+      let context: common.UIAbilityContext | null = null;
       try {
-        const context = getContext(this) as common.UIAbilityContext;
-        XrtcEngine.setContext(context);
-        console.info('[XDY] XrtcEngine.setContext 成功');
+        context = getContext(this) as common.UIAbilityContext;
       } catch (e) {
-        console.error('[XDY] setContext 失败: ' + (e instanceof Error ? e.message : String(e)));
-        return;
+        console.warn('[XDY] 获取 Context 失败: ' + (e instanceof Error ? e.message : String(e)));
       }
-      const params: ChannelInitParams = new ChannelInitParams(appId, rtcType, domain, secretKey);
+      const params: ChannelInitParams = new ChannelInitParams(appId, rtcType, domain, secretKey, context);
       this.rtcEngine = XrtcEngine.createRtc(params);
       if (!this.rtcEngine) { console.error('[XDY] createRtc 失败'); return; }
       this.rtcHandler = new XdyRtcHandler(this);
