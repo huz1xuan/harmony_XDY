@@ -117,15 +117,18 @@ class ChannelInitParams extends InitParams {
   private _rtcType: RtcType;
   private _domain: string;
   private _secretKey: string;
-  constructor(appId: string, rtcType: RtcType, domain: string, secretKey: string) {
+  private _context: common.UIAbilityContext | null;
+  constructor(appId: string, rtcType: RtcType, domain: string, secretKey: string, context: common.UIAbilityContext | null) {
     super();
     this._appId = appId; this._rtcType = rtcType;
     this._domain = domain; this._secretKey = secretKey;
+    this._context = context;
   }
   appId(): string { return this._appId; }
   rtcType(): RtcType { return this._rtcType; }
   domain(): string { return this._domain; }
   secretKey(): string { return this._secretKey; }
+  appContext(): common.UIAbilityContext | null { return this._context; }
 }
 
 // ===== RTC 事件处理器 =====
@@ -231,6 +234,11 @@ struct XdyClassPage {
     } catch (e) {
       this.screenWidth = 640;
     }
+    // 将 App Context 注入到 SDK，供声网 RTC 初始化使用
+    try {
+      const ctx = getContext(this) as common.UIAbilityContext;
+      XrtcEngine.setContext(ctx);
+    } catch (_e) {}
     // 申请权限
     try {
       const ctx = getContext(this) as common.UIAbilityContext;
@@ -891,16 +899,13 @@ struct XdyClassPage {
     // Android端：刷新时不销毁RTC，直接复用
     // 只有在引擎不存在时才创建新引擎
     if (!this.rtcEngine) {
-      // 必须在创建引擎前设置 Context
+      let context: common.UIAbilityContext | null = null;
       try {
-        const context = getContext(this) as common.UIAbilityContext;
-        XrtcEngine.setContext(context);
-        console.info('[XDY] XrtcEngine.setContext 成功');
+        context = getContext(this) as common.UIAbilityContext;
       } catch (e) {
-        console.error('[XDY] setContext 失败: ' + (e instanceof Error ? e.message : String(e)));
-        return;
+        console.warn('[XDY] 获取 Context 失败: ' + (e instanceof Error ? e.message : String(e)));
       }
-      const params: ChannelInitParams = new ChannelInitParams(appId, rtcType, domain, secretKey);
+      const params: ChannelInitParams = new ChannelInitParams(appId, rtcType, domain, secretKey, context);
       this.rtcEngine = XrtcEngine.createRtc(params);
       if (!this.rtcEngine) { console.error('[XDY] createRtc 失败'); return; }
       this.rtcHandler = new XdyRtcHandler(this);
@@ -995,8 +1000,12 @@ struct XdyClassPage {
       if (this.rtcEngine) {
         const up: UserParam = new UserParam(uid);
         if (uid === this.selfUid) {
+          // enableLocalAudio 启动麦克风采集（enableAudio 仅启用音频模块，不保证本地采集）
+          this.rtcEngine.enableLocalAudio(audio);
           this.rtcEngine.enableLocalVideo(video);
+          // setupLocalVideo 需在 enableLocalVideo 之后调用
           this.rtcEngine.setLocalVideo(surfaceId, true, RenderMode.RENDER_MODE_HIDDEN, up);
+          // muteLocal* 控制帧数据是否发送（配合 switchRole 内的 updateChannelMediaOptions）
           this.rtcEngine.muteLocalVideoStream(!video);
           this.rtcEngine.muteLocalAudioStream(!audio);
           const setupCode: number = 0; // 与Android一致，setLocalVideo始终成功返回0
@@ -1044,6 +1053,7 @@ struct XdyClassPage {
         if (this.rtcEngine) {
           const up: UserParam = new UserParam(uid);
           if (uid === this.selfUid) {
+            this.rtcEngine.enableLocalAudio(audio);
             this.rtcEngine.enableLocalVideo(video);
             this.rtcEngine.setLocalVideo(surfaceId, true, RenderMode.RENDER_MODE_HIDDEN, up);
             this.rtcEngine.muteLocalVideoStream(!video);
@@ -1116,6 +1126,21 @@ struct XdyClassPage {
     this.native2Js('2003', 0, '加入频道',
       '{"uid":' + this.selfUid + ',"rtcType":"' + rtcTypeStr + '"}');
     console.info('[XDY] 加入频道成功 channel=' + channel + ' uid=' + uid.getUid());
+    
+    // 回扫 memberMap：对已开摄像头/麦克风的成员主动推流（冲版情况下 joinChanneled=false 时每有校准）
+    this.memberMap.forEach((mi, membUid) => {
+      if (membUid === this.selfUid) return;
+      let found = false;
+      for (const pv of this.playerViews) {
+        if (pv.userId === membUid) { found = true; break; }
+      }
+      if (!found && (mi.openCamera > 0 || mi.openMicrophones > 0)) {
+        const userRole = mi.userRole ?? 'normal';
+        const userName = mi.userName ?? '';
+        console.info('[XDY] handleJoinSuccess: 补推流 uid=' + membUid + ', userRole=' + userRole);
+        this.pushStream(membUid, mi.openCamera > 0, mi.openMicrophones > 0, this.channelId, userRole, userName);
+      }
+    });
   }
 
   handleLeaveSuccess(): void {
