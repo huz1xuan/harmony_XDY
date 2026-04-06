@@ -234,11 +234,6 @@ struct XdyClassPage {
     } catch (e) {
       this.screenWidth = 640;
     }
-    // 将 App Context 注入到 SDK，供声网 RTC 初始化使用
-    try {
-      const ctx = getContext(this) as common.UIAbilityContext;
-      XrtcEngine.setContext(ctx);
-    } catch (_e) {}
     // 申请权限
     try {
       const ctx = getContext(this) as common.UIAbilityContext;
@@ -303,6 +298,22 @@ struct XdyClassPage {
           // Android 端通过 shouldOverrideUrlLoading 关闭 Activity，我们在此拦截并重定向到登录页
           if (url.indexOf('xdyui2.xuedianyun.com') >= 0) {
             console.info('[XDY] 拦截管理页跳转: ' + url);
+            // H5 未经 1004 消息直接跳转退出，需在此处销毁 RTC 引擎，防止引擎残留导致重新进入时异常
+            if (!this.isOut) {
+              this.isOut = true;
+              this.joinChanneled = false;
+              this.isRefreshing = false;
+              if (this.rtcEngine) {
+                try {
+                  if (this.rtcHandler) { this.rtcEngine.removeEventHandler(this.rtcHandler); }
+                  this.rtcEngine.leaveChannel();
+                  // 不调 destroy，保持 native 引擎活跃，防止重进时 -7
+                } catch (_e) {}
+                this.rtcEngine = null;
+              }
+              this.reset();
+              console.info('[XDY] onLoadIntercept: RTC引擎已销毁，视图已清空');
+            }
             try {
               webview.WebCookieManager.clearAllCookiesSync();
               // 当前页面还在 pclive 域，可清除 pclive 的 localStorage
@@ -366,8 +377,9 @@ struct XdyClassPage {
       this.isOut = true;
       if (this.rtcEngine) {
         try {
+          if (this.rtcHandler) { this.rtcEngine.removeEventHandler(this.rtcHandler); }
           this.rtcEngine.leaveChannel();
-          this.rtcEngine.destroy();
+          // 不调 destroy，保持 native 引擎活跃，防止重进时 -7
         } catch (_e) {}
         this.rtcEngine = null;
       }
@@ -378,6 +390,10 @@ struct XdyClassPage {
         this.webviewCtrl.removeCache(true);
         this.webviewCtrl.loadUrl(this.homeUrl);
       } catch (_e) {}
+      return;
+    }
+    if (messageId === 'video_broadcast') {
+      this.handleVideoBroadcast(val);
       return;
     }
     if (messageId !== 'nativeWebRtcAction') return;
@@ -414,6 +430,8 @@ struct XdyClassPage {
   // 1000 WebView加载
   handleLoadWebView(msgData: string): void {
     console.info('[XDY] handleLoadWebView: msgData=' + msgData);
+    // 收到 1000 initNativeApp 消息代表 H5 已重新加载，必须重置 isOut 确保后续加入频道不被拦截
+    this.isOut = false;
     this.native2Js('2000', 0, '加载webview', '{"os":"android"}');
   }
 
@@ -524,22 +542,42 @@ struct XdyClassPage {
     console.info('[XDY] handleJoinChannel: data=' + data + ', name=' + name);
     try {
       const jo = JSON.parse(data) as JoinChannelData;
-      this.selfUid = jo.uid;
-      
+
       // 重置刷新标志
       this.isRefreshing = false;
       this.isOut = false;
-      
-      // 回调JS - 与Android端一致
-      const joinData = '{"uid":' + this.selfUid + ',"type":"1003"}';
-      const script = 'js2native("join",\'' + joinData + '\')';
-      try {
-        this.webviewCtrl.runJavaScript(script);
-      } catch (_e) {}
 
       if (name === '加入频道') {
+        // 引擎已存在则直接跳过 doJoinChannel，避免重复销毁/重建：
+        //   ① 刷新场景：reset() 不销毁引擎，刷新后 H5 重发 1003，此时引擎仍活着
+        //   ② 重复 1003：H5 在加入中（joinChanneled=false）快速重发，引擎已创建未完成
+        // 对齐安卓端：关闭/重建 Activity 保证每次进入时引擎为 null；
+        // 鸿蒙端以 rtcEngine 是否为 null 作为等价判断
+        if (this.rtcEngine) {
+          if (this.joinChanneled && jo.channelId === this.channelId) {
+            // 刷新场景：引擎活着且已在频道。补发 join 回调让 H5 知道我们已在频道，停止重试 1003。
+            console.info('[XDY] handleJoinChannel: 刷新场景，已在频道，补发 join 回调 uid=' + jo.uid);
+            this.selfUid = jo.uid;
+            const refreshJoinData = '{"uid":' + this.selfUid + ',"type":"1003"}';
+            const refreshScript = 'js2native("join",\'' + refreshJoinData + '\')';
+            try { this.webviewCtrl.runJavaScript(refreshScript); } catch (_e) {}
+          } else {
+            console.warn('[XDY] handleJoinChannel: 引擎已存在未完成加入，跳过重复 1003 uid=' + jo.uid);
+          }
+          return;
+        }
+        this.selfUid = jo.uid;
+        // 回调JS - 与Android端一致
+        const joinData = '{"uid":' + this.selfUid + ',"type":"1003"}';
+        const script = 'js2native("join",\'' + joinData + '\')';
+        try { this.webviewCtrl.runJavaScript(script); } catch (_e) {}
         this.doJoinChannel(jo.channelId, jo.uid, jo.appId, jo.domain, jo.secretKey,
           jo.sdkType, jo.channelMode, jo.channelKey, jo.videoProfile, jo.videoDynamicSubscribe);
+      } else {
+        this.selfUid = jo.uid;
+        const joinData = '{"uid":' + this.selfUid + ',"type":"1003"}';
+        const script = 'js2native("join",\'' + joinData + '\')';
+        try { this.webviewCtrl.runJavaScript(script); } catch (_e) {}
       }
     } catch (e) {
       console.error('[XDY] handleJoinChannel err: ' + (e instanceof Error ? e.message : String(e)));
@@ -581,7 +619,10 @@ struct XdyClassPage {
     this.isExiting = true;
     this.isRefreshing = false;
     
-    // 销毁 RTC 引擎
+    // 退出课堂：只调 leaveChannel，不 destroy。
+    // 原因：RtcNapi.destroySync() 在 HarmonyOS 上不可靠，
+    // native 引擎实际未清理，重进时 RtcNapi.initialize() 失败返回 -7；
+    // 保持引擎活跃（initialized=true），重进时复用引擎直接 joinChannel 即可。
     if (this.rtcEngine) {
       try {
         this.rtcEngine.muteLocalVideoStream(true);
@@ -590,7 +631,6 @@ struct XdyClassPage {
           this.rtcEngine.removeEventHandler(this.rtcHandler);
         }
         this.rtcEngine.leaveChannel();
-        this.rtcEngine.destroy();
       } catch (_e) {}
       this.rtcEngine = null;
     }
@@ -791,6 +831,34 @@ struct XdyClassPage {
     }
   }
 
+  // video_broadcast: 老师端发起的推流/取消推流控制（与 Android 端对齐）
+  // actionType=1: 开启本端推流；actionType=0: 关闭本端推流
+  handleVideoBroadcast(val: string): void {
+    try {
+      const jo = JSON.parse(val) as Record<string, Object>;
+      const toNodeId: number = jo['toNodeId'] as number;
+      const actionType: number = jo['actionType'] as number;
+      // 只处理发给本设备用户的消息
+      if (toNodeId !== this.selfUid || !this.joinChanneled) {
+        console.info('[XDY] video_broadcast: 忽略 toNodeId=' + toNodeId + ' (selfUid=' + this.selfUid + ', joinChanneled=' + this.joinChanneled + ')');
+        return;
+      }
+      console.info('[XDY] video_broadcast: actionType=' + actionType + ', toNodeId=' + toNodeId);
+      if (actionType === 1) {
+        // 开启本端音视频并推流
+        const mi = this.memberMap.get(this.selfUid);
+        const userRole: string = mi?.userRole ?? 'normal';
+        const userName: string = mi?.userName ?? '';
+        this.pushStream(this.selfUid, true, true, this.channelId, userRole, userName);
+      } else if (actionType === 0) {
+        // 关闭本端推流
+        this.cancelStream(this.selfUid, this.channelId);
+      }
+    } catch (e) {
+      console.error('[XDY] handleVideoBroadcast err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
   // 1009 系统信息
   handleSysInfo(): void {
     this.native2Js('2009', 0, '系统信息', '{"memoryUsage":100,"memory":2048,"volumeGain":0}');
@@ -896,9 +964,26 @@ struct XdyClassPage {
     else if (sdkType === 'trtc') { rtcType = RtcType.TRtc; }
     else if (sdkType === 'yunxinrtc') { rtcType = RtcType.WRtc; }
     
-    // Android端：刷新时不销毁RTC，直接复用
-    // 只有在引擎不存在时才创建新引擎
-    if (!this.rtcEngine) {
+    // 若引擎已存在（onLoadIntercept 未彻底销毁的边角情况），先销毁再重建
+    // 注意：刷新场景已在 handleJoinChannel 中提前 return，不会到达此处
+    // 每个销毁操作单独 try-catch，防止某一步失败阻断后续清理
+    if (this.rtcEngine) {
+      console.info('[XDY] doJoinChannel: RTC引擎已存在（边角情况），先销毁再重新创建');
+      try {
+        if (this.rtcHandler) {
+          this.rtcEngine.removeEventHandler(this.rtcHandler);
+          this.rtcHandler = null;
+        }
+      } catch (_e) { console.warn('[XDY] removeEventHandler 失败 ' + String(_e)); }
+      try { this.rtcEngine.leaveChannel(); } catch (_e) { console.warn('[XDY] leaveChannel 失败 ' + String(_e)); }
+      try { this.rtcEngine.destroy(); } catch (_e) { console.warn('[XDY] destroy 失败 ' + String(_e)); }
+      this.rtcEngine = null;
+      this.rtcHandler = null;
+      this.joinChanneled = false;
+    }
+
+    // 创建新引擎
+    {
       let context: common.UIAbilityContext | null = null;
       try {
         context = getContext(this) as common.UIAbilityContext;
@@ -908,6 +993,8 @@ struct XdyClassPage {
       const params: ChannelInitParams = new ChannelInitParams(appId, rtcType, domain, secretKey, context);
       this.rtcEngine = XrtcEngine.createRtc(params);
       if (!this.rtcEngine) { console.error('[XDY] createRtc 失败'); return; }
+      // 先移除旧 session 残留的回调（复用引擎时有效）
+      if (this.rtcHandler) { this.rtcEngine.removeEventHandler(this.rtcHandler); }
       this.rtcHandler = new XdyRtcHandler(this);
       this.rtcEngine.addEventHandler(this.rtcHandler);
       let scenario: AudioScenarioType = AudioScenarioType.AUDIO_SCENARIO_DEFAULT;
@@ -915,21 +1002,18 @@ struct XdyClassPage {
       else if (channelMode === 'ChatRoom') { scenario = AudioScenarioType.AUDIO_SCENARIO_CHATROOM; }
       this.rtcEngine.setAudioProfileScenario(scenario);
       this.rtcEngine.configVideoEncoder(getVideoConfig(videoProfile));
-    } else {
-      console.info('[XDY] doJoinChannel: RTC引擎已存在，先退出旧频道再重新加入');
-      // 设置正在重新加入标志，防止handleLeaveSuccess执行清理逻辑
-      this.isRejoining = true;
-      // 先退出旧频道，确保引擎处于正确状态
-      try {
-        this.rtcEngine.leaveChannel();
-      } catch (_e) {
-        console.warn('[XDY] doJoinChannel: leaveChannel 失败 ' + String(_e));
-      }
     }
     
     UserParam.getLocal().setUid(uid);
     const userParam: UserParam = new UserParam(uid);
-    this.rtcEngine.joinChannel(userParam, channelKey, channelId);
+    const joinRet: number = this.rtcEngine.joinChannel(userParam, channelKey, channelId);
+    if (joinRet < 0) {
+      // joinChannel 同步返回失败时（如引擎内部状态异常），清除引擎让下次 1003 重新创建
+      console.error('[XDY] joinChannel 返回失败 ret=' + joinRet + '，清除引擎等待重试');
+      try { this.rtcEngine.destroy(); } catch (_e) {}
+      this.rtcEngine = null;
+      this.joinChanneled = false;
+    }
   }
 
   // Native → JS 通知
