@@ -7,11 +7,24 @@
         "material": {
           "certpath": "/Users/mac/.ohos/config/default_harmony_XDY_GEbg6L8Fd51kJrpI7VphEYmKUCmzbrwCXwqNBz6D3OM=.cer",
           "keyAlias": "debugKey",
-          "keyPassword": "0000001B3CEB7EA74263690C09116A36A73EC7195FFCBEF365C91642D58FE3DDC0D1738292BD1D0DDF2E82",
+          "keyPassword": "0000001B8DE09D145DB1D10B7D28FF6D2AD400C230BB97671AEF39090F37686492B5426815B73E1E772179",
           "profile": "/Users/mac/.ohos/config/default_harmony_XDY_GEbg6L8Fd51kJrpI7VphEYmKUCmzbrwCXwqNBz6D3OM=.p7b",
           "signAlg": "SHA256withECDSA",
           "storeFile": "/Users/mac/.ohos/config/default_harmony_XDY_GEbg6L8Fd51kJrpI7VphEYmKUCmzbrwCXwqNBz6D3OM=.p12",
-          "storePassword": "0000001BAA8F3DE8F5060F337007B81D8F9ECE03393AFDD76D50AA055EB9C2EB1BB3566AEED6F783503F97"
+          "storePassword": "0000001B78AC63FE99963DFA5BEB4EE132D96ED90D8774802E8F169055A4C4E2809906B706E067BC90E588"
+        }
+      },
+      {
+        "name": "release",
+        "type": "HarmonyOS",
+        "material": {
+          "storeFile": "/Users/mac/work/harmony_XDY/signingconfig/harmonyXDY.p12",
+          "storePassword": "0000001A58D3B2B121457D67141CFF2354293F9DE643A2636ED26AC966870343C7A4DC21F1D701C2D3E6",
+          "keyAlias": "harmonyXDY",
+          "keyPassword": "0000001A819B047B03160253C6512A5E824F426BBF60BDBD1253A879BBA74F53B6711D0B7FF106EBF2DF",
+          "signAlg": "SHA256withECDSA",
+          "profile": "/Users/mac/work/harmony_XDY/signingconfig/harmonyXDYRelease.p7b",
+          "certpath": "/Users/mac/work/harmony_XDY/signingconfig/harmonyXDY.cer"
         }
       }
     ],
@@ -32,7 +45,7 @@
     ],
     "buildModeSet": [
       {
-        "name": "debug",
+        "name": "debug"
       },
       {
         "name": "release"

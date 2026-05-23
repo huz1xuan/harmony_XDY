@@ -2,6 +2,10 @@ import webview from '@ohos.web.webview';
 import display from '@ohos.display';
 import abilityAccessCtrl from '@ohos.abilityAccessCtrl';
 import common from '@ohos.app.ability.common';
+import bundleManager from '@ohos.bundle.bundleManager';
+import { deviceInfo } from '@kit.BasicServicesKit';
+import { audio } from '@kit.AudioKit';
+import { DeviceLogReporter } from '../utils/DeviceLogReporter';
 import {
   XrtcEngine, IEngineEventHandler, UserParam, UserUUID, TipInfo,
   LocalAudioStats, RemoteAudioStats, LocalVideoStats, RemoteVideoStats,
@@ -41,6 +45,13 @@ class PlayerViewInfo {
   visible: boolean = false;
   volumeBtn: number = 0;
   zoomBtn: number = 0;
+  upUserId: number = 0;   // showstage 视图记录被哪个用户占用
+  isUp: boolean = false;  // normal/host 视图记录是否已上台
+  origLeft: number = 0;   // 上台前原始位置（下台时恢复）
+  origTop: number = 0;
+  origWidth: number = 0;
+  origHeight: number = 0;
+  origRadius: number = 0;
 
   constructor(init?: Partial<PlayerViewInfo>) {
     if (init) {
@@ -70,6 +81,8 @@ interface JoinChannelData {
   channelId: string; uid: number; channelMode: string; channelKey: string;
   videoProfile: string; videoDynamicSubscribe: boolean;
 }
+interface UpDownStageItem { nodeId: number; userName?: string; }
+interface UpDownStageData { list: UpDownStageItem[]; }
 interface MemberListData { list: MemberInfo[]; }
 interface ViewCellListData { list: ViewCellData[]; }
 interface MuteData { uid: number; mute: boolean; }
@@ -197,9 +210,15 @@ struct VideoItemView {
 struct XdyClassPage {
   @State playerViews: PlayerViewInfo[] = [];
 
+  private static readonly SDK_VERSION: string = 'v5.5.5.20251226';
+
+  private appVersion: string = 'v1.0.0';   // 从 bundleManager 动态读取
+  private appBuild: number = 1;              // 从 bundleManager 动态读取
+  private versionReady: boolean = false;
+
   private webviewCtrl: webview.WebviewController = new webview.WebviewController();
   private jsBridge: NativeBridge = new NativeBridge();
-  private homeUrl: string = 'https://pclive.xuedianyun.com/xdyclass/?mobileWeb=true&appVersion=v5.5.5.20251226';
+  private homeUrl: string = 'https://pclive.xuedianyun.com/xdyclass/?mobileWeb=true&appVersion=v1.0.0';
   private channelId: string = '';
   private selfUid: number = -1;
   private joinChanneled: boolean = false;
@@ -228,11 +247,20 @@ struct XdyClassPage {
 
   aboutToAppear(): void {
     this.jsBridge.setHandler((msgId: string, val: string) => { this.onJs2Native(msgId, val); });
+    // 从 bundleManager 读取应用版本号（单一数据源：app.json5）
+    this.initAppVersion();
     try {
       const disp = display.getDefaultDisplaySync();
       this.screenWidth = px2vp(Math.max(disp.width, disp.height));
     } catch (e) {
       this.screenWidth = 640;
+    }
+    // 启动设备日志上报模块
+    try {
+      const ctx = getContext(this) as common.UIAbilityContext;
+      DeviceLogReporter.getInstance().start(ctx);
+    } catch (e) {
+      console.warn('[XDY] DeviceLogReporter启动失败: ' + (e instanceof Error ? e.message : String(e)));
     }
     // 申请权限
     try {
@@ -245,7 +273,24 @@ struct XdyClassPage {
       console.warn('[XDY] 权限申请异常');
     }
   }
+
+  // 从 app.json5 读取版本号，作为唯一数据源
+  private initAppVersion(): void {
+    try {
+      const bundleInfo = bundleManager.getBundleInfoForSelfSync(bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT);
+      const vn: string = bundleInfo.versionName ?? '1.0.0';
+      this.appVersion = 'v' + vn;
+      this.appBuild = bundleInfo.versionCode ?? 1;
+      this.homeUrl = 'https://pclive.xuedianyun.com/xdyclass/?mobileWeb=true&appVersion=' + this.appVersion;
+      this.versionReady = true;
+    } catch (e) {
+      console.warn('[XDY] 读取应用版本失败: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
   aboutToDisappear(): void {
+    // 停止设备日志上报
+    DeviceLogReporter.getInstance().stop();
     if (this.rtcEngine) {
       if (this.rtcHandler && this.rtcEngine) { this.rtcEngine.removeEventHandler(this.rtcHandler); }
       this.rtcEngine.leaveChannel();
@@ -277,7 +322,7 @@ struct XdyClassPage {
         .zoomAccess(false)
         .mediaPlayGestureAccess(false)
         .cacheMode(CacheMode.None)
-        .userAgent('Mozilla/5.0 (Linux; Android 10; HarmonyOS) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36 XdyAndroid/1.0')
+        .userAgent('Mozilla/5.0 (Linux; Android 10; HarmonyOS) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36 XdyAndroid/' + this.appVersion)
         .onPermissionRequest((event) => {
           if (event && event.request) { event.request.grant(event.request.getAccessibleResource()); }
         })
@@ -416,6 +461,7 @@ struct XdyClassPage {
         case '1008': this.handleCancelStream(msgData); break;
         case '1009': this.handleSysInfo(); break;
         case '1010': this.handleDeviceInfo(); break;
+        case '1014': this.handleUpDownStage(msgData); break;
         case '1015': this.handleSwitchCamera(); break;
         case '1020': this.handleVolume(msgData); break;
         case '1051': this.handleWebDialog(msgData); break;
@@ -865,7 +911,7 @@ struct XdyClassPage {
   }
 
   // 1010 设备信息
-  handleDeviceInfo(): void {
+  async handleDeviceInfo(): Promise<void> {
     try {
       const disp = display.getDefaultDisplaySync();
       const pw: number = disp.width;
@@ -874,25 +920,158 @@ struct XdyClassPage {
       const dpiRatio: number = disp.densityDPI / 160;
       const mw: number = Math.max(pw, ph);
       const mh: number = Math.min(pw, ph);
+
+      // 真实设备信息
+      const sysName: string = 'HarmonyOS';
+      const sysVersion: string = deviceInfo.osFullName ?? 'unknown';
+      const modelName: string = deviceInfo.productModel ?? 'unknown';
+      const brand: string = deviceInfo.brand ?? 'unknown';
+      const devType: string = deviceInfo.deviceType ?? 'unknown';
+      const sdkApi: number = deviceInfo.sdkApiVersion ?? 0;
+
+      // 动态获取音量
+      let systemMaxVol: number = 7;
+      let systemCurVol: number = 0;
+      let musicMaxVol: number = 15;
+      let musicCurVol: number = 2;
+      try {
+        const sysVolMgr = audio.getAudioManager().getVolumeManager();
+        const sysGrpMgr = await sysVolMgr.getVolumeGroupManager(audio.DEFAULT_VOLUME_GROUP_ID);
+        systemMaxVol = sysGrpMgr.getMaxVolumeSync(audio.AudioVolumeType.RINGTONE);
+        systemCurVol = sysGrpMgr.getVolumeSync(audio.AudioVolumeType.RINGTONE);
+        musicMaxVol = sysGrpMgr.getMaxVolumeSync(audio.AudioVolumeType.MEDIA);
+        musicCurVol = sysGrpMgr.getVolumeSync(audio.AudioVolumeType.MEDIA);
+      } catch (_volErr) {
+        console.warn('[XDY] 获取音量信息失败，使用默认值');
+      }
+
+      // 获取 CPU 核心数和总内存（HarmonyOS 无直接公开 API，使用 deviceInfo 可获取字段）
+      let cpuCores: number = 0;
+      let totalRam: number = 0;
+      try {
+        // HarmonyOS 无公开 totalRam/cpuCores API，通过可用属性推断或使用默认值
+        cpuCores = 4; // 无公开 API，给合理默认值
+        totalRam = 0; // 无公开 API，由服务端忽略 0 值
+      } catch (_e) {}
+
       const info: string = '{"rtcSdk":{"agoraRtc":"4.3.2.17"},' +
-        '"deviceSysName":"Android","deviceSysVersion":"10","deviceModelName":"HarmonyOS",' +
+        '"deviceSysName":"' + sysName + '","deviceSysVersion":"' + sysVersion + '","deviceModelName":"' + modelName + '",' +
+        '"brand":"' + brand + '","deviceType":"' + devType + '","sdkApiVersion":' + sdkApi + ',' +
+        '"totalRam":' + totalRam + ',"cpuCores":' + cpuCores + ',' +
         '"deviceWidth":' + mw + ',"deviceWidth1":' + mw + ',"deviceWidth2":' + mw +
         ',"deviceWidth3":' + mw + ',"deviceWidth4":' + mw + ',"deviceWidth5":' + mw + ',' +
         '"deviceHeight":' + mh + ',"deviceHeight1":' + mh + ',"deviceHeight2":' + mh +
         ',"deviceHeight3":' + mh + ',"deviceHeight4":' + mh + ',"deviceHeight5":' + mh + ',' +
         '"dpi":' + dpiRatio + ',' +
-        '"systemMaxVolume":7,"systemCurrentVolume":0,"musicMaxVolume":15,"musicCurrentVolume":2,' +
-        '"appName":"学点云课堂","appVersion":"v1.0.0","sdkVersion":"v1.0.0","appBuild":1}';
+        '"systemMaxVolume":' + systemMaxVol + ',"systemCurrentVolume":' + systemCurVol +
+        ',"musicMaxVolume":' + musicMaxVol + ',"musicCurrentVolume":' + musicCurVol + ',' +
+        '"appName":"学点云课堂","appVersion":"' + this.appVersion + '","sdkVersion":"' + XdyClassPage.SDK_VERSION + '","appBuild":' + this.appBuild + '}';
       this.native2Js('2010', 0, '设备信息', info);
     } catch (e) {
+      const verPart: string = '"appName":"学点云课堂","appVersion":"' +
+        this.appVersion + '","sdkVersion":"' + XdyClassPage.SDK_VERSION + '","appBuild":' + this.appBuild + '}';
       this.native2Js('2010', 0, '设备信息',
         '{"rtcSdk":{"agoraRtc":"4.3.2.17"},' +
-        '"deviceSysName":"Android","deviceSysVersion":"10","deviceModelName":"HarmonyOS",' +
+        '"deviceSysName":"HarmonyOS","deviceSysVersion":"unknown","deviceModelName":"unknown",' +
+        '"brand":"unknown","deviceType":"unknown","sdkApiVersion":0,' +
+        '"totalRam":0,"cpuCores":0,' +
         '"deviceWidth":1280,"deviceWidth1":1280,"deviceWidth2":1280,"deviceWidth3":1280,"deviceWidth4":1280,"deviceWidth5":1280,' +
         '"deviceHeight":800,"deviceHeight1":800,"deviceHeight2":800,"deviceHeight3":800,"deviceHeight4":800,"deviceHeight5":800,' +
         '"dpi":2.5,' +
         '"systemMaxVolume":7,"systemCurrentVolume":0,"musicMaxVolume":15,"musicCurrentVolume":2,' +
-        '"appName":"学点云课堂","appVersion":"v1.0.0","sdkVersion":"v1.0.0","appBuild":1}');
+        verPart);
+    }
+  }
+
+  // 1014 视频上台/下台
+  handleUpDownStage(data: string): void {
+    try {
+      const jo = JSON.parse(data) as UpDownStageData;
+      const list: UpDownStageItem[] = jo.list ?? [];
+
+      // 收集本次上台的 uid 列表
+      const upUidList: number[] = [];
+      for (const item of list) {
+        upUidList.push(item.nodeId);
+      }
+
+      // 上台处理
+      for (const item of list) {
+        const uid = item.nodeId;
+
+        // 检查是否已在 showstage 中
+        let alreadyUp = false;
+        for (const pv of this.playerViews) {
+          if (pv.userRole === 'showstage' && pv.upUserId === uid) {
+            alreadyUp = true;
+            break;
+          }
+        }
+        if (alreadyUp) continue;
+
+        // 找到 normal/host 角色中该 uid 对应的视图
+        let targetView: PlayerViewInfo | null = null;
+        let stageView: PlayerViewInfo | null = null;
+        for (const pv of this.playerViews) {
+          if ((pv.userRole === 'normal' || pv.userRole === 'host') && pv.userId === uid) {
+            targetView = pv;
+          }
+        }
+        for (const pv of this.playerViews) {
+          if (pv.userRole === 'showstage' && pv.upUserId === 0) {
+            stageView = pv;
+            break;
+          }
+        }
+
+        if (targetView !== null && stageView !== null && !targetView.isUp) {
+          // 保存原始位置
+          targetView.origLeft = targetView.left;
+          targetView.origTop = targetView.top;
+          targetView.origWidth = targetView.width;
+          targetView.origHeight = targetView.height;
+          targetView.origRadius = targetView.radius;
+          // 移动到 showstage 区域
+          targetView.left = stageView.left;
+          targetView.top = stageView.top;
+          targetView.width = stageView.width;
+          targetView.height = stageView.height;
+          targetView.radius = stageView.radius;
+          targetView.isUp = true;
+          // 标记 stageView 被占用
+          stageView.upUserId = uid;
+          console.info('[XDY] handleUpDownStage: 上台 uid=' + uid + ' -> showstage left=' + stageView.left + ',top=' + stageView.top);
+        }
+      }
+
+      // 下台处理：对不在 upUidList 中的已上台视图，恢复原位
+      for (const pv of this.playerViews) {
+        if ((pv.userRole === 'normal' || pv.userRole === 'host') && pv.isUp) {
+          let stillUp = false;
+          for (const id of upUidList) {
+            if (id === pv.userId) { stillUp = true; break; }
+          }
+          if (!stillUp) {
+            pv.left = pv.origLeft;
+            pv.top = pv.origTop;
+            pv.width = pv.origWidth;
+            pv.height = pv.origHeight;
+            pv.radius = pv.origRadius;
+            pv.isUp = false;
+            // 清除对应 stageView 的占用标记
+            for (const sv of this.playerViews) {
+              if (sv.userRole === 'showstage' && sv.upUserId === pv.userId) {
+                sv.upUserId = 0;
+              }
+            }
+            console.info('[XDY] handleUpDownStage: 下台 uid=' + pv.userId);
+          }
+        }
+      }
+
+      console.info('[XDY] handleUpDownStage: 上台用户数=' + list.length);
+    } catch (e) {
+      console.error('[XDY] handleUpDownStage err: ' + (e instanceof Error ? e.message : String(e)));
     }
   }
 
@@ -959,6 +1138,12 @@ struct XdyClassPage {
     channelKey: string, videoProfile: string, dynSub: boolean): void {
     this.channelId = channelId;
     this.videoDynamicSubscribe = dynSub;
+    // 同步 channelId/uid 到 DeviceLogReporter，确保日志携带正确的会话信息
+    try {
+      DeviceLogReporter.getInstance().updateSession(channelId, uid);
+    } catch (e) {
+      console.warn('[XDY] 更新 DeviceLogReporter 会话信息失败: ' + (e instanceof Error ? e.message : String(e)));
+    }
     let rtcType: RtcType = RtcType.Agora;
     if (sdkType === 'hrtc') { rtcType = RtcType.HRtc; }
     else if (sdkType === 'trtc') { rtcType = RtcType.TRtc; }

@@ -1,0 +1,4 @@
+所有的密码均为harmonyXDY
+打包时点击file下的project structure的signing configs，debug让studio自己生成无所谓，release必须严格按照路径放好并填入，然后改动相关配置文件
+每次更新后记得修改version和version code
+release版本的hap可直接拖入模拟机或者真机进行安装，app仅可用于上架，debug版本的hap包可以在deveco studio中安装或者使用hdc工具安装

@@ -2,8 +2,8 @@
   "app": {
     "bundleName": "com.xdy.harmony_xdy",
     "vendor": "example",
-    "versionCode": 1000000,
-    "versionName": "1.0.0",
+    "versionCode": 5552025,
+    "versionName": "5.5.5.20251226",
     "icon": "$media:logo",
     "label": "$string:app_name"
   }
