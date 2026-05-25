@@ -88,6 +88,8 @@ interface ViewCellListData { list: ViewCellData[]; }
 interface MuteData { uid: number; mute: boolean; }
 interface PushStreamData { uid: number; video: boolean; audio: boolean; userRole?: string; userName?: string; }
 interface CancelStreamData { uid: number; }
+interface PlayLiveData { viewId?: string; url?: string; nodeId: number; width?: string; height?: string; }
+interface ScreenShareViewData { divId?: string; volume?: number; }
 interface VolumeData { value?: number; openVolumeGain?: boolean; }
 interface LeaveChannelData { uid: number; channelId: string; action: string; }
 interface LocalStatsObj {
@@ -236,6 +238,8 @@ struct XdyClassPage {
   private localStatsAudioReady: boolean = false;
   private isExiting: boolean = false;
   private isRefreshing: boolean = false;
+  private screenShareDivId: string = '';
+  private screenShareVolume: number = 0;
   private localStatsVideoReady: boolean = false;
   private localStats: LocalStatsObj = {
     uid: 0, audiosentSampleRate: 0, audioSendBytesNow: 0, audioSendBytes: 0,
@@ -439,6 +443,26 @@ struct XdyClassPage {
     }
     if (messageId === 'video_broadcast') {
       this.handleVideoBroadcast(val);
+      return;
+    }
+    if (messageId === 'setScreenShareView') {
+      this.handleSetScreenShareView(val);
+      return;
+    }
+    if (messageId === 'playLive') {
+      this.handlePlayLive(val);
+      return;
+    }
+    if (messageId === 'stopPlayLive') {
+      this.handleStopPlayLive(val);
+      return;
+    }
+    if (messageId === 'publishScreenShare') {
+      console.info('[XDY] publishScreenShare: 学生端不支持屏幕共享发起');
+      return;
+    }
+    if (messageId === 'stopPublishScreenShare') {
+      console.info('[XDY] stopPublishScreenShare: 学生端不支持停止屏幕共享');
       return;
     }
     if (messageId !== 'nativeWebRtcAction') return;
@@ -902,6 +926,98 @@ struct XdyClassPage {
       }
     } catch (e) {
       console.error('[XDY] handleVideoBroadcast err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // ===== 屏幕共享相关处理 =====
+
+  // setScreenShareView: 存储屏幕共享配置信息
+  handleSetScreenShareView(val: string): void {
+    try {
+      const jo = JSON.parse(val) as ScreenShareViewData;
+      this.screenShareDivId = jo.divId ?? '';
+      this.screenShareVolume = jo.volume ?? 0;
+      console.info('[XDY] handleSetScreenShareView: divId=' + this.screenShareDivId + ', volume=' + this.screenShareVolume);
+    } catch (e) {
+      console.error('[XDY] handleSetScreenShareView err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // playLive: 学生端接收老师屏幕共享
+  handlePlayLive(val: string): void {
+    try {
+      const jo = JSON.parse(val) as PlayLiveData;
+      const nodeId: number = jo.nodeId;
+      const url: string = jo.url ?? '';
+      console.info('[XDY] handlePlayLive: nodeId=' + nodeId + ', url=' + url);
+
+      if (!this.rtcEngine || !this.joinChanneled) {
+        console.warn('[XDY] handlePlayLive: rtcEngine或joinChanneled未就绪，忽略');
+        return;
+      }
+
+      // 检查是否已经有该nodeId绑定的视图
+      for (const pv of this.playerViews) {
+        if (pv.userId === nodeId && pv.isPlaying) {
+          console.info('[XDY] handlePlayLive: nodeId=' + nodeId + ' 已在播放，跳过');
+          return;
+        }
+      }
+
+      // 寻找空闲的playerView（userId === 0 且 surfaceId 存在）
+      let targetPv: PlayerViewInfo | null = null;
+      for (const pv of this.playerViews) {
+        if (pv.userId === 0 && pv.surfaceId && !pv.isPlaying) {
+          targetPv = pv;
+          break;
+        }
+      }
+
+      if (!targetPv) {
+        console.warn('[XDY] handlePlayLive: 未找到空闲视图用于屏幕共享 nodeId=' + nodeId);
+        return;
+      }
+
+      // 订阅远端屏幕共享视频流
+      const up: UserParam = new UserParam(nodeId);
+      this.rtcEngine.setRemoteVideo(targetPv.surfaceId, true, RenderMode.RENDER_MODE_FIT, up);
+      targetPv.userId = nodeId;
+      targetPv.isPlaying = true;
+      targetPv.visible = true;
+      targetPv.userName = '屏幕共享';
+      console.info('[XDY] handlePlayLive: 屏幕共享订阅成功 nodeId=' + nodeId + ' -> vid=' + targetPv.vid);
+    } catch (e) {
+      console.error('[XDY] handlePlayLive err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // stopPlayLive: 停止接收屏幕共享
+  handleStopPlayLive(val: string): void {
+    try {
+      const jo = JSON.parse(val) as PlayLiveData;
+      const nodeId: number = jo.nodeId;
+      console.info('[XDY] handleStopPlayLive: nodeId=' + nodeId);
+
+      if (!this.rtcEngine) {
+        console.warn('[XDY] handleStopPlayLive: rtcEngine未就绪，忽略');
+        return;
+      }
+
+      // 根据nodeId找到对应的playerView并取消订阅
+      for (const pv of this.playerViews) {
+        if (pv.userId === nodeId) {
+          const up: UserParam = new UserParam(nodeId);
+          this.rtcEngine.setRemoteVideo(pv.surfaceId, false, RenderMode.RENDER_MODE_FIT, up);
+          pv.userId = 0;
+          pv.isPlaying = false;
+          pv.visible = false;
+          pv.userName = '';
+          console.info('[XDY] handleStopPlayLive: 屏幕共享取消订阅成功 nodeId=' + nodeId + ', vid=' + pv.vid);
+          break;
+        }
+      }
+    } catch (e) {
+      console.error('[XDY] handleStopPlayLive err: ' + (e instanceof Error ? e.message : String(e)));
     }
   }
 
