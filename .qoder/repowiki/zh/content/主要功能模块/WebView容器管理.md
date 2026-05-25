@@ -4,9 +4,15 @@
 **本文档引用的文件**
 - [Index.ets](file://entry/src/main/ets/pages/Index.ets)
 - [EntryAbility.ets](file://entry/src/main/ets/entryability/EntryAbility.ets)
-- [harmonylog.md](file://harmonylog.md)
 - [鸿蒙端实现分析与优化建议.md](file://鸿蒙端实现分析与优化建议.md)
 </cite>
+
+## 更新摘要
+**变更内容**
+- 增强WebView拦截逻辑，特别针对管理页面跳转的处理机制
+- 新增引擎残留防护机制，防止H5直接跳转退出导致的引擎残留问题
+- 完善URL拦截处理流程，包括引擎销毁、状态重置和登录态清理
+- 优化边角情况处理，确保引擎状态的一致性和稳定性
 
 ## 目录
 1. [简介](#简介)
@@ -27,6 +33,7 @@
 - 权限请求处理与生命周期事件
 - 混合内容模式、缓存策略、用户代理设置等最佳实践
 - WebView与原生应用的交互机制（JS Bridge）
+- **新增**：增强的引擎残留防护机制和边角情况处理
 
 ## 项目结构
 该项目采用ArkTS + Web组件 + XComponent三层架构，其中WebView承载H5课堂内容，XComponent用于视频浮层渲染，ArkTS原生层负责音视频引擎管理与控制。
@@ -58,13 +65,13 @@ Page --> RTC
 Page --> Permission
 ```
 
-图表来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L195-L360)
-- [EntryAbility.ets](file://entry/src/main/ets/entryability/EntryAbility.ets#L14-L65)
+**图表来源**
+- [Index.ets:195-360](file://entry/src/main/ets/pages/Index.ets#L195-L360)
+- [EntryAbility.ets:14-65](file://entry/src/main/ets/entryability/EntryAbility.ets#L14-L65)
 
-章节来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L1-L1436)
-- [EntryAbility.ets](file://entry/src/main/ets/entryability/EntryAbility.ets#L1-L65)
+**章节来源**
+- [Index.ets:1-1436](file://entry/src/main/ets/pages/Index.ets#L1-L1436)
+- [EntryAbility.ets:1-65](file://entry/src/main/ets/entryability/EntryAbility.ets#L1-L65)
 
 ## 核心组件
 - Web组件控制器：负责WebView的生命周期、配置与交互
@@ -72,15 +79,16 @@ Page --> Permission
 - 权限管理器：申请并处理摄像头与麦克风权限
 - 音视频引擎：基于XRTC SDK管理推拉流与渲染
 - 视频浮层：基于XComponent叠加在WebView之上的视频渲染层
+- **新增**：引擎残留防护机制：防止H5直接跳转退出导致的引擎残留问题
 
-章节来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L195-L360)
+**章节来源**
+- [Index.ets:195-360](file://entry/src/main/ets/pages/Index.ets#L195-L360)
 
 ## 架构总览
 WebView容器管理的核心流程如下：
 - 初始化阶段：创建WebviewController，配置JavaScript访问、代理、缓存、UA等参数，并注册权限请求回调
 - 页面加载阶段：注入全局js2native函数，建立H5到原生的消息通道
-- URL拦截阶段：拦截管理后台跳转，清理登录态并重载登录页
+- URL拦截阶段：拦截管理后台跳转，清理登录态并重载登录页，**新增**：销毁引擎防止残留
 - 生命周期阶段：处理页面出现/消失、权限申请、音视频引擎销毁等
 
 ```mermaid
@@ -98,16 +106,18 @@ Bridge->>Native : 分发消息类型
 Native->>RTC : 执行音视频操作
 Native-->>H5 : 通过runJavaScript回调H5
 Web->>Native : onLoadIntercept拦截URL
+Note over Native : 检测管理页面跳转
+Native->>Native : 销毁引擎防止残留
 Native->>Web : 清理Cookie/Storage/缓存并重载登录页
 ```
 
-图表来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L257-L342)
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L362-L424)
+**图表来源**
+- [Index.ets:257-342](file://entry/src/main/ets/pages/Index.ets#L257-L342)
+- [Index.ets:362-424](file://entry/src/main/ets/pages/Index.ets#L362-L424)
 
-章节来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L257-L342)
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L362-L424)
+**章节来源**
+- [Index.ets:257-342](file://entry/src/main/ets/pages/Index.ets#L257-L342)
+- [Index.ets:362-424](file://entry/src/main/ets/pages/Index.ets#L362-L424)
 
 ## 详细组件分析
 
@@ -136,33 +146,40 @@ UA --> Perm["注册权限请求回调"]
 Perm --> End(["完成初始化"])
 ```
 
-图表来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L257-L287)
+**图表来源**
+- [Index.ets:257-287](file://entry/src/main/ets/pages/Index.ets#L257-L287)
 
-章节来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L257-L287)
+**章节来源**
+- [Index.ets:257-287](file://entry/src/main/ets/pages/Index.ets#L257-L287)
 
-### URL拦截处理机制
+### URL拦截处理机制与引擎残留防护
 - 拦截条件：当URL包含特定管理后台域名时触发拦截
+- **增强**：引擎残留防护机制：检测到管理页面跳转时，销毁音视频引擎防止残留
 - 处理流程：清理Cookie、localStorage、sessionStorage，移除缓存并重载登录页
 - 阻断跳转：返回true阻止H5继续跳转至管理页
-- 退出课堂：在拦截时销毁音视频引擎，防止残留导致重新进入异常
+- **新增**：边角情况处理：即使onLoadIntercept未彻底销毁，也会在doJoinChannel中进行二次销毁
+- **新增**：状态重置：设置isOut标志，防止重复执行和异常状态
 
 ```mermaid
 flowchart TD
 Load(["页面加载"]) --> CheckURL["检查URL是否包含管理后台域"]
 CheckURL --> |是| Intercept["拦截URL"]
-Intercept --> Clear["清理Cookie/Storage/缓存"]
+Intercept --> EngineCheck{"引擎是否存在？"}
+EngineCheck --> |是| DestroyEngine["销毁音视频引擎"]
+EngineCheck --> |否| SkipDestroy["跳过销毁"]
+DestroyEngine --> SetFlag["设置isOut标志"]
+SkipDestroy --> SetFlag
+SetFlag --> Clear["清理Cookie/Storage/缓存"]
 Clear --> Reload["重载登录页"]
 Reload --> Block["阻断跳转"]
 CheckURL --> |否| Continue["继续加载"]
 ```
 
-图表来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L294-L340)
+**图表来源**
+- [Index.ets:303-349](file://entry/src/main/ets/pages/Index.ets#L303-L349)
 
-章节来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L294-L340)
+**章节来源**
+- [Index.ets:303-349](file://entry/src/main/ets/pages/Index.ets#L303-L349)
 
 ### JavaScript代理配置与消息分发
 - 代理对象：NativeBridge类封装_js2native方法，作为H5调用原生的入口
@@ -186,13 +203,13 @@ Handler-->>H5 : 通过runJavaScript回调结果
 end
 ```
 
-图表来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L107-L112)
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L362-L424)
+**图表来源**
+- [Index.ets:107-112](file://entry/src/main/ets/pages/Index.ets#L107-L112)
+- [Index.ets:362-424](file://entry/src/main/ets/pages/Index.ets#L362-L424)
 
-章节来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L107-L112)
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L362-L424)
+**章节来源**
+- [Index.ets:107-112](file://entry/src/main/ets/pages/Index.ets#L107-L112)
+- [Index.ets:362-424](file://entry/src/main/ets/pages/Index.ets#L362-L424)
 
 ### 权限请求处理
 - 权限申请：在页面出现时申请CAMERA与MICROPHONE权限
@@ -210,18 +227,19 @@ Fail --> WebPerm
 WebPerm --> End(["完成"])
 ```
 
-图表来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L237-L247)
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L281-L283)
+**图表来源**
+- [Index.ets:237-247](file://entry/src/main/ets/pages/Index.ets#L237-L247)
+- [Index.ets:281-283](file://entry/src/main/ets/pages/Index.ets#L281-L283)
 
-章节来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L237-L247)
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L281-L283)
+**章节来源**
+- [Index.ets:237-247](file://entry/src/main/ets/pages/Index.ets#L237-L247)
+- [Index.ets:281-283](file://entry/src/main/ets/pages/Index.ets#L281-L283)
 
 ### 页面加载拦截与H5课堂集成
 - 加载拦截：拦截管理后台跳转，清理登录态并重载登录页
 - 课堂集成：通过消息类型1000-1052与H5课堂内容进行深度集成，包括用户视图布局、成员列表、加入/离开频道、推流/取消推流、音视频控制等
 - 生命周期：在页面消失时销毁音视频引擎，释放资源
+- **新增**：引擎残留防护：在URL拦截和消息处理中双重保障引擎状态一致性
 
 ```mermaid
 sequenceDiagram
@@ -230,18 +248,19 @@ participant Web as "Web组件"
 participant Native as "原生层"
 H5->>Web : 发送消息类型1000-1052
 Web->>Native : onLoadIntercept拦截管理后台跳转
+Note over Native : 销毁引擎防止残留
 Native->>Web : 清理登录态并重载登录页
 Native->>Native : 分发消息类型并执行对应操作
 Native-->>H5 : 回调结果
 ```
 
-图表来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L294-L340)
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L426-L922)
+**图表来源**
+- [Index.ets:294-340](file://entry/src/main/ets/pages/Index.ets#L294-L340)
+- [Index.ets:426-922](file://entry/src/main/ets/pages/Index.ets#L426-L922)
 
-章节来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L294-L340)
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L426-L922)
+**章节来源**
+- [Index.ets:294-340](file://entry/src/main/ets/pages/Index.ets#L294-L340)
+- [Index.ets:426-922](file://entry/src/main/ets/pages/Index.ets#L426-L922)
 
 ### WebView配置参数说明与最佳实践
 - javaScriptAccess：启用JavaScript执行，确保H5页面可正常运行
@@ -254,22 +273,23 @@ Native-->>H5 : 回调结果
 - userAgent：自定义UA字符串，伪装为Android平台，确保H5识别为学生端
 - onPermissionRequest：注册权限请求回调，授权H5请求的可访问资源
 - onPageBegin：注入全局js2native函数，建立H5到原生的消息通道
-- onLoadIntercept：拦截管理后台跳转，清理登录态并重载登录页
+- onLoadIntercept：拦截管理后台跳转，清理登录态并重载登录页，**新增**：引擎残留防护
 
-章节来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L257-L287)
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L284-L340)
+**章节来源**
+- [Index.ets:257-287](file://entry/src/main/ets/pages/Index.ets#L257-L287)
+- [Index.ets:284-349](file://entry/src/main/ets/pages/Index.ets#L284-L349)
 
 ### WebView与原生应用的交互机制
 - JS Bridge：通过xdyAndroid._js2native实现H5到原生的消息传递
 - 原生到H5：通过runJavaScript执行H5侧的回调函数
 - 消息类型：涵盖加载、用户视图、成员列表、加入/离开频道、推流/取消推流、音视频控制、系统信息、设备信息、切换摄像头、音量增益、课堂记录等
 - 生命周期事件：页面出现/消失时处理权限申请、音视频引擎销毁等
+- **新增**：引擎残留防护：在消息处理和URL拦截中双重保障引擎状态一致性
 
-章节来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L107-L112)
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L362-L424)
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L987-L1001)
+**章节来源**
+- [Index.ets:107-112](file://entry/src/main/ets/pages/Index.ets#L107-L112)
+- [Index.ets:362-424](file://entry/src/main/ets/pages/Index.ets#L362-L424)
+- [Index.ets:987-1001](file://entry/src/main/ets/pages/Index.ets#L987-L1001)
 
 ## 依赖关系分析
 - Web组件依赖：@ohos.web.webview提供Web组件与WebviewController
@@ -287,11 +307,11 @@ Disp["@ohos.display"] --> Info["屏幕信息"]
 Common["@ohos.app.ability.common"] --> Ctx["应用上下文"]
 ```
 
-图表来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L1-L10)
+**图表来源**
+- [Index.ets:1-10](file://entry/src/main/ets/pages/Index.ets#L1-L10)
 
-章节来源
-- [Index.ets](file://entry/src/main/ets/pages/Index.ets#L1-L10)
+**章节来源**
+- [Index.ets:1-10](file://entry/src/main/ets/pages/Index.ets#L1-L10)
 
 ## 性能考量
 - 缓存策略：禁用缓存可确保内容实时更新，但可能增加网络负载；可根据业务需求调整
@@ -299,6 +319,7 @@ Common["@ohos.app.ability.common"] --> Ctx["应用上下文"]
 - 视口与文本缩放：合理配置视口与文本缩放，避免过度缩放导致的性能问题
 - 权限申请：权限申请应在页面出现时尽早发起，减少后续阻塞
 - 生命周期：页面消失时及时销毁音视频引擎，释放内存与CPU资源
+- **新增**：引擎残留防护：通过多重检查机制防止引擎残留，提升应用稳定性
 
 ## 故障排查指南
 - 日志分析：参考harmonylog.md中的日志输出，定位问题发生的时间点与上下文
@@ -306,10 +327,11 @@ Common["@ohos.app.ability.common"] --> Ctx["应用上下文"]
 - URL拦截：若管理后台跳转异常，检查onLoadIntercept拦截逻辑与清理步骤
 - JS Bridge：若消息类型未生效，检查javaScriptProxy配置与_js2native方法调用
 - 生命周期：若页面消失后仍有资源占用，检查aboutToDisappear中的销毁逻辑
+- **新增**：引擎残留问题：检查isOut标志设置、引擎销毁流程和边角情况处理
+- **新增**：状态同步问题：验证URL拦截和消息处理中的状态一致性
 
-章节来源
-- [harmonylog.md](file://harmonylog.md#L1-L243)
-- [鸿蒙端实现分析与优化建议.md](file://鸿蒙端实现分析与优化建议.md#L1-L334)
+**章节来源**
+- [鸿蒙端实现分析与优化建议.md:1-334](file://鸿蒙端实现分析与优化建议.md#L1-L334)
 
 ## 结论
-该WebView容器管理功能通过合理的初始化配置、严格的URL拦截与完善的JS Bridge机制，实现了H5课堂内容与原生应用的深度集成。在权限管理、生命周期控制与资源释放方面也提供了清晰的实现路径。建议在后续迭代中进一步完善异常处理、网络状态监听与性能优化，以提升整体稳定性与用户体验。
+该WebView容器管理功能通过合理的初始化配置、严格的URL拦截与完善的JS Bridge机制，实现了H5课堂内容与原生应用的深度集成。**最新更新**增强了引擎残留防护机制，通过URL拦截处理和边角情况处理双重保障，有效防止了H5直接跳转退出导致的引擎残留问题。在权限管理、生命周期控制与资源释放方面也提供了清晰的实现路径。建议在后续迭代中进一步完善异常处理、网络状态监听与性能优化，以提升整体稳定性与用户体验。

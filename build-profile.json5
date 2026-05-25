@@ -7,31 +7,31 @@
         "material": {
           "certpath": "/Users/mac/.ohos/config/default_harmony_XDY_GEbg6L8Fd51kJrpI7VphEYmKUCmzbrwCXwqNBz6D3OM=.cer",
           "keyAlias": "debugKey",
-          "keyPassword": "0000001B8DE09D145DB1D10B7D28FF6D2AD400C230BB97671AEF39090F37686492B5426815B73E1E772179",
+          "keyPassword": "0000001BB1D13B35B8E61E82E36C54D500A354915E9B44A75A9DA3AFB113AE47CEE0D95A2C0A414761029E",
           "profile": "/Users/mac/.ohos/config/default_harmony_XDY_GEbg6L8Fd51kJrpI7VphEYmKUCmzbrwCXwqNBz6D3OM=.p7b",
           "signAlg": "SHA256withECDSA",
           "storeFile": "/Users/mac/.ohos/config/default_harmony_XDY_GEbg6L8Fd51kJrpI7VphEYmKUCmzbrwCXwqNBz6D3OM=.p12",
-          "storePassword": "0000001B78AC63FE99963DFA5BEB4EE132D96ED90D8774802E8F169055A4C4E2809906B706E067BC90E588"
+          "storePassword": "0000001B0A43C4D96709400D6AA3B81DAAA7F5185D9C8DC03631C964D98CC5DAADDAF6BF3D27B0D0F90581"
         }
       },
       {
         "name": "release",
         "type": "HarmonyOS",
         "material": {
-          "storeFile": "/Users/mac/work/harmony_XDY/signingconfig/harmonyXDY.p12",
-          "storePassword": "0000001A58D3B2B121457D67141CFF2354293F9DE643A2636ED26AC966870343C7A4DC21F1D701C2D3E6",
+          "certpath": "/Users/mac/work/harmony_XDY/signingconfig/harmonyXDY.cer",
           "keyAlias": "harmonyXDY",
-          "keyPassword": "0000001A819B047B03160253C6512A5E824F426BBF60BDBD1253A879BBA74F53B6711D0B7FF106EBF2DF",
-          "signAlg": "SHA256withECDSA",
+          "keyPassword": "0000001A14BB3224F5BBBD4FF2312CA6D630EAA4620BE931D1A932AE02CD55808B9F49F02B2191BBD969",
           "profile": "/Users/mac/work/harmony_XDY/signingconfig/harmonyXDYRelease.p7b",
-          "certpath": "/Users/mac/work/harmony_XDY/signingconfig/harmonyXDY.cer"
+          "signAlg": "SHA256withECDSA",
+          "storeFile": "/Users/mac/work/harmony_XDY/signingconfig/harmonyXDY.p12",
+          "storePassword": "0000001A8F999BC3557CC0F4EA33CB2516BC98487DC3BDC6255B76315B685D8E3D3FB9FE0095F09F204E"
         }
       }
     ],
     "products": [
       {
         "name": "default",
-        "signingConfig": "default",
+        "signingConfig": "release",
         "targetSdkVersion": "6.0.1(21)",
         "compatibleSdkVersion": "6.0.1(21)",
         "runtimeOS": "HarmonyOS",

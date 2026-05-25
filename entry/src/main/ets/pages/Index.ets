@@ -172,7 +172,7 @@ struct VideoItemView {
   onSurfaceReady: (vid: string, surfaceId: string) => void = (_v: string, _s: string) => {};
 
   build() {
-    Stack({ alignContent: Alignment.TopStart }) {
+    Stack({ alignContent: Alignment.Center }) {
       XComponent({
         id: 'xc_' + this.pv.vid,
         type: XComponentType.SURFACE,
@@ -185,6 +185,20 @@ struct VideoItemView {
         .width('100%')
         .height('100%')
         .backgroundColor(Color.Black)
+      // 仅音频状态：全黑遮罩 + 麦克风图标（视频muted且音频未muted）
+      if (this.pv.videoMuted && this.pv.isPlaying) {
+        Column() {
+          if (!this.pv.audioMuted) {
+            Text('\uD83C\uDF99')
+              .fontSize(40)
+              .fontColor(Color.White)
+          }
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor(Color.Black)
+        .justifyContent(FlexAlign.Center)
+      }
       if (this.pv.visible && this.pv.userName.length > 0) {
         Text(this.pv.userName)
           .fontSize(10)
@@ -240,6 +254,8 @@ struct XdyClassPage {
   private isRefreshing: boolean = false;
   private screenShareDivId: string = '';
   private screenShareVolume: number = 0;
+  private screenSharePending: boolean = false;
+  private screenShareFromNodeId: number = 0;
   private localStatsVideoReady: boolean = false;
   private localStats: LocalStatsObj = {
     uid: 0, audiosentSampleRate: 0, audioSendBytesNow: 0, audioSendBytes: 0,
@@ -465,6 +481,28 @@ struct XdyClassPage {
       console.info('[XDY] stopPublishScreenShare: 学生端不支持停止屏幕共享');
       return;
     }
+    if (messageId === 'screen_share_play') {
+      this.handleScreenSharePlay(val);
+      return;
+    }
+    if (messageId === 'screen_share_stop') {
+      this.handleScreenShareStop(val);
+      return;
+    }
+    if (messageId === 'video_stop') {
+      // 检查是否是屏幕共享的 video_stop
+      try {
+        const stopData = JSON.parse(val) as Record<string, Object>;
+        const stopNodeId: number = stopData['fromNodeId'] as number;
+        for (const pv of this.playerViews) {
+          if (pv.vid === 'mScreenShareView' && pv.userId === stopNodeId && pv.isPlaying) {
+            this.handleScreenShareStop(val);
+            break;
+          }
+        }
+      } catch (e) {}
+      return;
+    }
     if (messageId !== 'nativeWebRtcAction') return;
     try {
       const jo = JSON.parse(val) as JsMsgRoot;
@@ -503,6 +541,45 @@ struct XdyClassPage {
     // 收到 1000 initNativeApp 消息代表 H5 已重新加载，必须重置 isOut 确保后续加入频道不被拦截
     this.isOut = false;
     this.native2Js('2000', 0, '加载webview', '{"os":"android"}');
+    // H5 应用层已就绪，注入屏幕共享 API Hook
+    this.injectScreenShareHook();
+  }
+
+  // 注入 JS Hook：拦截 xdysdk.api 中屏幕共享相关调用，转发到 native bridge
+  injectScreenShareHook(): void {
+    const script: string = '(function(){' +
+      'if(window._xdyApiHooked)return;' +
+      'window._xdyApiHooked=true;' +
+      'function hookXdySdk(){' +
+        'if(typeof xdysdk==="undefined"||!xdysdk||!xdysdk.api){' +
+          'setTimeout(hookXdySdk,200);return;' +
+        '}' +
+        'var originalApi=xdysdk.api.bind(xdysdk);' +
+        'xdysdk.api=function(name,params){' +
+          'if(name==="playLive"||name==="stopPlayLive"||name==="setScreenShareView"){' +
+            'console.log("[XDY-Hook] xdysdk.api intercepted: "+name+", params="+JSON.stringify(params));' +
+            'try{js2native(name,JSON.stringify(params||{}));}' +
+            'catch(e){console.error("[XDY-Hook] js2native error: "+e.message);}' +
+            'return;' +
+          '}' +
+          'return originalApi(name,params);' +
+        '};' +
+        'console.log("[XDY-Hook] xdysdk.api hooked for screenShare");' +
+      '}' +
+      'hookXdySdk();' +
+    '})();';
+    try {
+      const promise = this.webviewCtrl.runJavaScript(script);
+      if (promise && typeof promise.then === 'function') {
+        promise.then(() => {
+          console.info('[XDY] injectScreenShareHook: 注入成功');
+        }).catch((e: Error) => {
+          console.error('[XDY] injectScreenShareHook: 注入失败 ' + e.message);
+        });
+      }
+    } catch (e) {
+      console.error('[XDY] injectScreenShareHook err: ' + (e instanceof Error ? e.message : String(e)));
+    }
   }
 
   // 1001 用户视图布局 - 照抄Android端逻辑
@@ -807,32 +884,36 @@ struct XdyClassPage {
       const jo = JSON.parse(data) as MuteData;
       const uid: number = jo.uid; const mute: boolean = jo.mute;
       if (uid === this.selfUid && this.rtcEngine) {
-        let success: number = -1;
         if (mute) {
-          this.rtcEngine.muteLocalAudioStream(false);
-          this.native2Js('2007', 0, '推流开关音频', '{"uid":' + uid + ',"mute":false}');
-          success = this.rtcEngine.muteLocalVideoStream(true);
-        } else {
-          // 开启摄像头：先取消静音
-          success = this.rtcEngine.muteLocalVideoStream(false);
-          // 检查是否需要绑定视图（刷新后视图可能未绑定）
-          let hasBoundView = false;
+          // 停止采集
+          this.rtcEngine.enableLocalVideo(false);
+          // 解除本地视图绑定
+          const up: UserParam = new UserParam(uid);
           for (const pv of this.playerViews) {
-            if (pv.userId === uid && pv.isPlaying) {
-              hasBoundView = true;
-              break;
+            if (pv.userId === uid) {
+              this.rtcEngine.setLocalVideo(pv.surfaceId, false, RenderMode.RENDER_MODE_HIDDEN, up);
+              // 保持visible=true，由videoMuted黑色遮罩覆盖
             }
           }
-          if (!hasBoundView) {
-            // 没有绑定视图，需要重新推流绑定
-            const mi = this.memberMap.get(uid);
-            const userRole = mi?.userRole ?? 'normal';
-            const userName = mi?.userName ?? '';
-            console.info('[XDY] handleMuteVideo: 本地用户未绑定视图，重新推流 uid=' + uid);
-            this.pushStream(uid, true, true, this.channelId, userRole, userName);
+          // 停止发送视频流
+          this.rtcEngine.muteLocalVideoStream(true);
+          this.native2Js('2006', 0, '推流关闭视频', '{"uid":' + uid + ',"mute":true}');
+        } else {
+          // 恢复采集
+          this.rtcEngine.enableLocalVideo(true);
+          // 取消静音
+          this.rtcEngine.muteLocalVideoStream(false);
+          // 重新绑定本地视频surface（恢复本地预览）
+          const up: UserParam = new UserParam(uid);
+          for (const pv of this.playerViews) {
+            if (pv.userId === uid && pv.surfaceId) {
+              this.rtcEngine.setLocalVideo(pv.surfaceId, true, RenderMode.RENDER_MODE_HIDDEN, up);
+              pv.visible = true;
+              console.info('[XDY] handleMuteVideo: 重新绑定本地视频 uid=' + uid + ' surfaceId=' + pv.surfaceId);
+            }
           }
+          this.native2Js('2006', 0, '推流开启视频', '{"uid":' + uid + ',"mute":false}');
         }
-        this.native2Js('2006', success >= 0 ? 0 : 1, '推流开关视频', '{"uid":' + uid + ',"mute":' + (mute ? 'true' : 'false') + '}');
       }
       const mi = this.memberMap.get(uid);
       if (mi) { mi.videoMuted = mute; this.memberMap.set(uid, mi); }
@@ -854,8 +935,6 @@ struct XdyClassPage {
       if (uid === this.selfUid && this.rtcEngine) {
         let success: number = -1;
         if (mute) {
-          this.rtcEngine.muteLocalVideoStream(false);
-          this.native2Js('2006', 0, '推流开关视频', '{"uid":' + uid + ',"mute":false}');
           success = this.rtcEngine.muteLocalAudioStream(true);
         } else {
           // 开启麦克风：先取消静音
@@ -923,6 +1002,9 @@ struct XdyClassPage {
       } else if (actionType === 0) {
         // 关闭本端推流
         this.cancelStream(this.selfUid, this.channelId);
+      } else if (actionType === 2) {
+        // Web端发送的停止推流
+        this.cancelStream(this.selfUid, this.channelId);
       }
     } catch (e) {
       console.error('[XDY] handleVideoBroadcast err: ' + (e instanceof Error ? e.message : String(e)));
@@ -932,6 +1014,84 @@ struct XdyClassPage {
   // ===== 屏幕共享相关处理 =====
 
   // setScreenShareView: 存储屏幕共享配置信息
+  // screen_share_play: 订阅屏幕共享流（通过识别不在memberMap中的远端UID）
+  handleScreenSharePlay(val: string): void {
+    try {
+      const data = JSON.parse(val) as Record<string, Object>;
+      const fromNodeId: number = data['fromNodeId'] as number;
+      const mediaType: number = (data['mediaType'] as number) ?? 0;
+
+      console.info('[XDY] handleScreenSharePlay: fromNodeId=' + fromNodeId + ', mediaType=' + mediaType);
+
+      this.screenSharePending = true;
+      this.screenShareFromNodeId = fromNodeId;
+
+      if (!this.rtcEngine || !this.joinChanneled) {
+        console.warn('[XDY] handleScreenSharePlay: rtcEngine或joinChanneled未就绪，等待用户加入后自动订阅');
+        return;
+      }
+
+      // 查找已加入但不在memberMap中的UID（即屏幕共享流UID）
+      let screenShareUid: number = 0;
+      this.rtcModelMap.forEach((_model: RtcModelInfo, uid: number) => {
+        if (!this.memberMap.has(uid) && uid !== this.selfUid) {
+          screenShareUid = uid;
+        }
+      });
+
+      if (screenShareUid > 0) {
+        this.subscribeScreenShare(screenShareUid);
+      } else {
+        console.info('[XDY] handleScreenSharePlay: 屏幕共享UID尚未加入，等待onUserJoined/onFirstRemoteVideo');
+      }
+    } catch (e) {
+      console.error('[XDY] handleScreenSharePlay err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // 订阅屏幕共享流到 mScreenShareView
+  subscribeScreenShare(uid: number): void {
+    for (const pv of this.playerViews) {
+      if (pv.vid === 'mScreenShareView' && pv.surfaceId && this.rtcEngine) {
+        const up: UserParam = new UserParam(uid);
+        this.rtcEngine.setRemoteVideo(pv.surfaceId, true, RenderMode.RENDER_MODE_FIT, up);
+        pv.userId = uid;
+        pv.isPlaying = true;
+        pv.visible = true;
+        this.screenSharePending = false;
+        console.info('[XDY] subscribeScreenShare: 订阅屏幕共享成功 uid=' + uid + ', surfaceId=' + pv.surfaceId);
+        break;
+      }
+    }
+  }
+
+  // screen_share_stop: 停止屏幕共享订阅
+  handleScreenShareStop(val: string): void {
+    try {
+      const data = JSON.parse(val) as Record<string, Object>;
+      const fromNodeId: number = data['fromNodeId'] as number;
+
+      console.info('[XDY] handleScreenShareStop: fromNodeId=' + fromNodeId);
+
+      // 找到 mScreenShareView 视图并取消订阅
+      for (const pv of this.playerViews) {
+        if (pv.vid === 'mScreenShareView' && pv.surfaceId && this.rtcEngine) {
+          const up: UserParam = new UserParam(pv.userId > 0 ? pv.userId : fromNodeId);
+          this.rtcEngine.setRemoteVideo(pv.surfaceId, false, RenderMode.RENDER_MODE_FIT, up);
+          pv.userId = 0;
+          pv.isPlaying = false;
+          pv.visible = false;
+          console.info('[XDY] handleScreenShareStop: 取消屏幕共享订阅成功');
+          break;
+        }
+      }
+      this.screenSharePending = false;
+      this.screenShareFromNodeId = 0;
+    } catch (e) {
+      console.error('[XDY] handleScreenShareStop err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
   handleSetScreenShareView(val: string): void {
     try {
       const jo = JSON.parse(val) as ScreenShareViewData;
@@ -1552,7 +1712,18 @@ struct XdyClassPage {
   }
 
   handleUserJoined(uid: UserUUID): void {
-    console.info('[XDY] 远端用户加入 uid=' + uid.getUid());
+    const uidVal: number = uid.getUid();
+    console.info('[XDY] 远端用户加入 uid=' + uidVal + ', inMemberMap=' + this.memberMap.has(uidVal));
+    // 始终记录到rtcModelMap（确保后续搜索能找到）
+    if (!this.rtcModelMap.has(uidVal)) {
+      const m: RtcModelInfo = { uid: uidVal, audioMute: 0, videoMute: 0 };
+      this.rtcModelMap.set(uidVal, m);
+    }
+    // 如果该UID不在memberMap中且屏幕共享待订阅，自动订阅为屏幕共享
+    if (this.screenSharePending && !this.memberMap.has(uidVal) && uidVal !== this.selfUid) {
+      console.info('[XDY] handleUserJoined: 检测到屏幕共享UID=' + uidVal + '，自动订阅');
+      this.subscribeScreenShare(uidVal);
+    }
   }
 
   handleUserOffline(uid: UserUUID, reason: number): void {
@@ -1578,6 +1749,11 @@ struct XdyClassPage {
         this.rtcModelMap.set(uidVal, m);
       } else {
         model.videoMute = 0; model.audioMute = 0;
+      }
+      // 检查是否为待订阅的屏幕共享流
+      if (this.screenSharePending && uidVal !== this.selfUid) {
+        console.info('[XDY] handleFirstRemoteVideo: 检测到屏幕共享UID=' + uidVal + '，自动订阅');
+        this.subscribeScreenShare(uidVal);
       }
       return;
     }
@@ -1631,15 +1807,42 @@ struct XdyClassPage {
     if (model) { model.audioMute = muted ? 1 : 0; }
     const mi = this.memberMap.get(uidVal);
     if (mi) { mi.audioMuted = muted; this.memberMap.set(uidVal, mi); }
+    // 同步到playerView以驱动图标状态
+    for (const pv of this.playerViews) {
+      if (pv.userId === uidVal) { pv.audioMuted = muted; }
+    }
+    // 通知H5远端音频静音状态
+    this.native2Js('2007', 0, muted ? '远端关闭音频' : '远端开启音频',
+      '{"uid":' + uidVal + ',"mute":' + (muted ? 'true' : 'false') + '}');
   }
 
   handleUserMuteVideo(uid: UserUUID, muted: boolean): void {
     const uidVal: number = uid.getUid();
     if (uidVal === this.selfUid) return;
+    console.info('[XDY] handleUserMuteVideo: uid=' + uidVal + ', muted=' + muted);
     const model = this.rtcModelMap.get(uidVal);
     if (model) { model.videoMute = muted ? 1 : 0; }
     const mi = this.memberMap.get(uidVal);
     if (mi) { mi.videoMuted = muted; this.memberMap.set(uidVal, mi); }
+    // 通知H5远端视频静音状态（H5根据此状态显示麦克风/摄像头图标）
+    this.native2Js('2006', 0, muted ? '远端关闭视频' : '远端开启视频',
+      '{"uid":' + uidVal + ',"mute":' + (muted ? 'true' : 'false') + '}');
+    // 控制远端视图状态
+    if (this.rtcEngine) {
+      const up: UserParam = new UserParam(uidVal);
+      for (const pv of this.playerViews) {
+        if (pv.userId === uidVal) {
+          pv.videoMuted = muted;
+          if (muted) {
+            this.rtcEngine.setRemoteVideo(pv.surfaceId, false, RenderMode.RENDER_MODE_HIDDEN, up);
+            // 保持visible=true（显示黑底+麦克风图标），不让H5摄像头图标透出
+          } else {
+            this.rtcEngine.setRemoteVideo(pv.surfaceId, true, RenderMode.RENDER_MODE_HIDDEN, up);
+            pv.visible = true;
+          }
+        }
+      }
+    }
   }
 
   handleConnStateChange(state: ConnStateType): void {
