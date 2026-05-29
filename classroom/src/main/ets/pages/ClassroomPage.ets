@@ -1,0 +1,1978 @@
+import webview from '@ohos.web.webview';
+import display from '@ohos.display';
+import abilityAccessCtrl from '@ohos.abilityAccessCtrl';
+import common from '@ohos.app.ability.common';
+import bundleManager from '@ohos.bundle.bundleManager';
+import { deviceInfo } from '@kit.BasicServicesKit';
+import { audio } from '@kit.AudioKit';
+import { DeviceLogReporter } from '../utils/DeviceLogReporter';
+import {
+  XrtcEngine, IEngineEventHandler, UserParam, UserUUID, TipInfo,
+  LocalAudioStats, RemoteAudioStats, LocalVideoStats, RemoteVideoStats,
+  ConnStateType, RoleType, RenderMode, RtcType, InitParams,
+  AudioScenarioType, VideoEncodeType
+} from '@av/xrtc';
+
+// ===== 数据接口定义 =====
+interface ViewCellData {
+  id: string; width: number; height: number; left: number; top: number;
+  radius: number; userRole: string; volumeBtn: number; zoomBtn: number;
+  openDrag: boolean; openZoomControl: boolean;
+  videoAudioBtn: number; videoMuteBtn: number; audioMuteBtn: number;
+}
+interface MemberInfo {
+  uid: number; userName: string; userRole: string;
+  audioMuted: boolean; videoMuted: boolean;
+  openCamera: number; openMicrophones: number;
+}
+interface RtcModelInfo { uid: number; audioMute: number; videoMute: number; }
+@Observed
+class PlayerViewInfo {
+  vid: string = '';
+  userId: number = 0;
+  userRole: string = '';
+  userName: string = '';
+  isPlaying: boolean = false;
+  surfaceId: string = '';
+  audioMuted: boolean = false;
+  videoMuted: boolean = false;
+  channelId: string = '';
+  left: number = 0;
+  top: number = 0;
+  width: number = 0;
+  height: number = 0;
+  radius: number = 0;
+  visible: boolean = false;
+  volumeBtn: number = 0;
+  zoomBtn: number = 0;
+  upUserId: number = 0;   // showstage 视图记录被哪个用户占用
+  isUp: boolean = false;  // normal/host 视图记录是否已上台
+  origLeft: number = 0;   // 上台前原始位置（下台时恢复）
+  origTop: number = 0;
+  origWidth: number = 0;
+  origHeight: number = 0;
+  origRadius: number = 0;
+
+  constructor(init?: Partial<PlayerViewInfo>) {
+    if (init) {
+      this.vid = init.vid ?? '';
+      this.userId = init.userId ?? 0;
+      this.userRole = init.userRole ?? '';
+      this.userName = init.userName ?? '';
+      this.isPlaying = init.isPlaying ?? false;
+      this.surfaceId = init.surfaceId ?? '';
+      this.audioMuted = init.audioMuted ?? false;
+      this.videoMuted = init.videoMuted ?? false;
+      this.channelId = init.channelId ?? '';
+      this.left = init.left ?? 0;
+      this.top = init.top ?? 0;
+      this.width = init.width ?? 0;
+      this.height = init.height ?? 0;
+      this.radius = init.radius ?? 0;
+      this.visible = init.visible ?? false;
+      this.volumeBtn = init.volumeBtn ?? 0;
+      this.zoomBtn = init.zoomBtn ?? 0;
+    }
+  }
+}
+interface JsMsgRoot { type?: Object; data?: Object; name?: Object; }
+interface JoinChannelData {
+  appId: string; domain: string; secretKey: string; sdkType: string;
+  channelId: string; uid: number; channelMode: string; channelKey: string;
+  videoProfile: string; videoDynamicSubscribe: boolean;
+}
+interface UpDownStageItem { nodeId: number; userName?: string; }
+interface UpDownStageData { list: UpDownStageItem[]; }
+interface MemberListData { list: MemberInfo[]; }
+interface ViewCellListData { list: ViewCellData[]; }
+interface MuteData { uid: number; mute: boolean; }
+interface PushStreamData { uid: number; video: boolean; audio: boolean; userRole?: string; userName?: string; }
+interface CancelStreamData { uid: number; }
+interface PlayLiveData { viewId?: string; url?: string; nodeId: number; width?: string; height?: string; }
+interface ScreenShareViewData { divId?: string; volume?: number; }
+interface VolumeData { value?: number; openVolumeGain?: boolean; }
+interface LeaveChannelData { uid: number; channelId: string; action: string; }
+interface LocalStatsObj {
+  uid: number; audiosentSampleRate: number; audioSendBytesNow: number;
+  audioSendBytes: number; videoSendResolutionWidth: number;
+  videoSendResolutionHeight: number; videoSendFrameRate: number;
+  videoSendBytesNow: number; videoSendBytes: number;
+}
+interface RemoteStatsObj {
+  uid: number; endToEndDelay: number; audioTotalActiveTime: number;
+  audioReceivePacketsLost: number; audioReceiveBytesNow: number; audioReceiveBytes: number;
+  videoReceiveResolutionWidth: number; videoReceiveResolutionHeight: number;
+  videoReceiveDecodeFrameRate: number; videoReceiveBytesNow: number; videoReceiveBytes: number;
+  isAudio: boolean; isVideo: boolean;
+}
+
+// ===== 视频分辨率映射 =====
+function getVideoConfig(profile: string): VideoEncodeType {
+  const map: Record<string, VideoEncodeType> = {
+    '120p': VideoEncodeType.VIDEO_ENCODE_120P, '180p': VideoEncodeType.VIDEO_ENCODE_180P,
+    '240p': VideoEncodeType.VIDEO_ENCODE_240P, '360p': VideoEncodeType.VIDEO_ENCODE_360P,
+    '480p': VideoEncodeType.VIDEO_ENCODE_480P, '720p': VideoEncodeType.VIDEO_ENCODE_720P,
+    '1080p': VideoEncodeType.VIDEO_ENCODE_1080,
+    '360p_7': VideoEncodeType.VIDEO_ENCODE_360P_7, '480p_4': VideoEncodeType.VIDEO_ENCODE_480P_4,
+    '720p_3': VideoEncodeType.VIDEO_ENCODE_720P_3,
+  };
+  return map[profile] ?? VideoEncodeType.VIDEO_ENCODE_240P;
+}
+
+// ===== JS桥接对象（供WebView调用）=====
+class NativeBridge {
+  private handler: (msgId: string, val: string) => void = (_a: string, _b: string) => {};
+  setHandler(h: (msgId: string, val: string) => void): void { this.handler = h; }
+  _js2native(messageId: string, val: string): void { this.handler(messageId, val); }
+}
+
+// ===== InitParams 实现 =====
+class ChannelInitParams extends InitParams {
+  private _appId: string;
+  private _rtcType: RtcType;
+  private _domain: string;
+  private _secretKey: string;
+  private _context: common.UIAbilityContext | null;
+  constructor(appId: string, rtcType: RtcType, domain: string, secretKey: string, context: common.UIAbilityContext | null) {
+    super();
+    this._appId = appId; this._rtcType = rtcType;
+    this._domain = domain; this._secretKey = secretKey;
+    this._context = context;
+  }
+  appId(): string { return this._appId; }
+  rtcType(): RtcType { return this._rtcType; }
+  domain(): string { return this._domain; }
+  secretKey(): string { return this._secretKey; }
+  appContext(): common.UIAbilityContext | null { return this._context; }
+}
+
+// ===== RTC 事件处理器 =====
+class XdyRtcHandler implements IEngineEventHandler {
+  private page: ClassroomView;
+  constructor(page: ClassroomView) { this.page = page; }
+  onWarning(warn: TipInfo): void { console.warn('[RTC] warn=' + warn.getCode()); }
+  onError(error: TipInfo): void { this.page.handleRtcError(error); }
+  onJoinChannelSuccess(channel: string, uid: UserUUID): void { this.page.handleJoinSuccess(channel, uid); }
+  onLeaveChannel(): void { this.page.handleLeaveSuccess(); }
+  onUserJoined(uid: UserUUID): void { this.page.handleUserJoined(uid); }
+  onUserOffline(uid: UserUUID, reason: number): void { this.page.handleUserOffline(uid, reason); }
+  onFirstRemoteAudioDecoded(uid: UserUUID): void { this.page.handleFirstRemoteAudio(uid); }
+  onFirstRemoteVideoDecoded(uid: UserUUID): void { this.page.handleFirstRemoteVideo(uid); }
+  onUserMuteAudio(uid: UserUUID, muted: boolean): void { this.page.handleUserMuteAudio(uid, muted); }
+  onUserMuteVideo(uid: UserUUID, muted: boolean): void { this.page.handleUserMuteVideo(uid, muted); }
+  onConnStateChange(state: ConnStateType): void { this.page.handleConnStateChange(state); }
+  onAudioStats(l: LocalAudioStats | null, r: RemoteAudioStats | null): void { this.page.handleAudioStats(l, r); }
+  onVideoStats(l: LocalVideoStats | null, r: RemoteVideoStats | null): void { this.page.handleVideoStats(l, r); }
+}
+
+@Component
+struct VideoItemView {
+  @ObjectLink pv: PlayerViewInfo;
+  controller: XComponentController = new XComponentController();
+  onSurfaceReady: (vid: string, surfaceId: string) => void = (_v: string, _s: string) => {};
+
+  build() {
+    Stack({ alignContent: Alignment.Center }) {
+      XComponent({
+        id: 'xc_' + this.pv.vid,
+        type: XComponentType.SURFACE,
+        controller: this.controller
+      })
+        .onLoad(() => { 
+          console.info('[XDY] XComponent onLoad fired for vid=' + this.pv.vid);
+          this.onSurfaceReady(this.pv.vid, this.controller.getXComponentSurfaceId()); 
+        })
+        .width('100%')
+        .height('100%')
+        .backgroundColor(Color.Black)
+      // 仅音频状态：全黑遮罩 + 麦克风图标（视频muted且音频未muted）
+      if (this.pv.videoMuted && this.pv.isPlaying) {
+        Column() {
+          if (!this.pv.audioMuted) {
+            Text('\uD83C\uDF99')
+              .fontSize(40)
+              .fontColor(Color.White)
+          }
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor(Color.Black)
+        .justifyContent(FlexAlign.Center)
+      }
+      if (this.pv.visible && this.pv.userName.length > 0) {
+        Text(this.pv.userName)
+          .fontSize(10)
+          .fontColor(Color.White)
+          .backgroundColor('#66000000')
+          .padding({ left: 4, right: 4 })
+          .position({ x: 2, y: 2 })
+          .zIndex(1)
+      }
+    }
+    .position({ x: this.pv.left, y: this.pv.top })
+    .width(this.pv.width > 0 ? this.pv.width : 1)
+    .height(this.pv.height > 0 ? this.pv.height : 1)
+    .borderRadius(this.pv.radius)
+    .clip(true)
+    .backgroundColor(Color.Black)
+    .opacity(this.pv.visible ? 1 : 0)
+    .zIndex(this.pv.visible ? 10 : 0)
+  }
+}
+
+// ===== 主组件（由外层 @Entry 页面包装使用） =====
+@Component
+export struct ClassroomView {
+  @State playerViews: PlayerViewInfo[] = [];
+  @LocalStorageProp('classroomUrl') classroomUrl: string = '';
+
+  private static readonly SDK_VERSION: string = 'v5.5.5.20251226';
+
+  private appVersion: string = 'v1.0.0';   // 从 bundleManager 动态读取
+  private appBuild: number = 1;              // 从 bundleManager 动态读取
+  private versionReady: boolean = false;
+
+  private webviewCtrl: webview.WebviewController = new webview.WebviewController();
+  private jsBridge: NativeBridge = new NativeBridge();
+  private homeUrl: string = 'https://pclive.xuedianyun.com/xdyclass/?mobileWeb=true&appVersion=v1.0.0';
+  private channelId: string = '';
+  private selfUid: number = -1;
+  private joinChanneled: boolean = false;
+  private isOut: boolean = false;
+  private isRejoining: boolean = false;  // 是否正在重新加入频道（复用引擎时）
+  private rtcEngine: XrtcEngine | null = null;
+  private rtcHandler: XdyRtcHandler | null = null;
+  private memberMap: Map<number, MemberInfo> = new Map();
+  private rtcModelMap: Map<number, RtcModelInfo> = new Map();
+  private screenWidth: number = 640;
+  private videoDynamicSubscribe: boolean = false;
+  // 本地统计累积
+  private localAudioBytes: number = 0;
+  private localVideoBytes: number = 0;
+  private localStatsAudioReady: boolean = false;
+  private isExiting: boolean = false;
+  private isRefreshing: boolean = false;
+  private screenShareDivId: string = '';
+  private screenShareVolume: number = 0;
+  private screenSharePending: boolean = false;
+  private screenShareFromNodeId: number = 0;
+  private localStatsVideoReady: boolean = false;
+  private localStats: LocalStatsObj = {
+    uid: 0, audiosentSampleRate: 0, audioSendBytesNow: 0, audioSendBytes: 0,
+    videoSendResolutionWidth: 0, videoSendResolutionHeight: 0,
+    videoSendFrameRate: 0, videoSendBytesNow: 0, videoSendBytes: 0,
+  };
+  // 远端统计累积（按uid）
+  private remoteStatsMap: Map<number, RemoteStatsObj> = new Map();
+
+  aboutToAppear(): void {
+    // 使用客户传入的课堂URL（如有）
+    if (this.classroomUrl.length > 0) {
+      this.homeUrl = this.classroomUrl;
+    }
+    this.jsBridge.setHandler((msgId: string, val: string) => { this.onJs2Native(msgId, val); });
+    // 从 bundleManager 读取应用版本号（单一数据源：app.json5）
+    this.initAppVersion();
+    try {
+      const disp = display.getDefaultDisplaySync();
+      this.screenWidth = px2vp(Math.max(disp.width, disp.height));
+    } catch (e) {
+      this.screenWidth = 640;
+    }
+    // 启动设备日志上报模块
+    try {
+      const ctx = getContext(this) as common.UIAbilityContext;
+      DeviceLogReporter.getInstance().start(ctx);
+    } catch (e) {
+      console.warn('[XDY] DeviceLogReporter启动失败: ' + (e instanceof Error ? e.message : String(e)));
+    }
+    // 申请权限
+    try {
+      const ctx = getContext(this) as common.UIAbilityContext;
+      const atm = abilityAccessCtrl.createAtManager();
+      atm.requestPermissionsFromUser(ctx, ['ohos.permission.CAMERA', 'ohos.permission.MICROPHONE'])
+        .then(() => { console.info('[XDY] 权限申请完成'); })
+        .catch((e: Error) => { console.warn('[XDY] 权限申请失败: ' + e.message); });
+    } catch (e) {
+      console.warn('[XDY] 权限申请异常');
+    }
+  }
+
+  // 从 app.json5 读取版本号，作为唯一数据源
+  private initAppVersion(): void {
+    try {
+      const bundleInfo = bundleManager.getBundleInfoForSelfSync(bundleManager.BundleFlag.GET_BUNDLE_INFO_DEFAULT);
+      const vn: string = bundleInfo.versionName ?? '1.0.0';
+      this.appVersion = 'v' + vn;
+      this.appBuild = bundleInfo.versionCode ?? 1;
+      // 仅当没有传入 classroomUrl 时，使用默认 URL
+      if (this.classroomUrl.length === 0) {
+        this.homeUrl = 'https://pclive.xuedianyun.com/xdyclass/?mobileWeb=true&appVersion=' + this.appVersion;
+      }
+      this.versionReady = true;
+    } catch (e) {
+      console.warn('[XDY] 读取应用版本失败: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  aboutToDisappear(): void {
+    // 停止设备日志上报
+    DeviceLogReporter.getInstance().stop();
+    if (this.rtcEngine) {
+      if (this.rtcHandler && this.rtcEngine) { this.rtcEngine.removeEventHandler(this.rtcHandler); }
+      this.rtcEngine.leaveChannel();
+      this.rtcEngine.destroy();
+      this.rtcEngine = null;
+    }
+  }
+
+  build() {
+    Stack({ alignContent: Alignment.TopStart }) {
+      // WebView 课堂内容层
+      Web({ src: this.homeUrl, controller: this.webviewCtrl })
+        .width('100%')
+        .height('100%')
+        .javaScriptAccess(true)
+        .javaScriptProxy({
+          object: this.jsBridge,
+          name: 'xdyAndroid',
+          methodList: ['_js2native'],
+          controller: this.webviewCtrl
+        })
+        .domStorageAccess(true)
+        .fileAccess(true)
+        .mixedMode(MixedMode.All)
+        .overviewModeAccess(true)
+        .metaViewport(true)
+        .textZoomRatio(100)
+        .textAutosizing(false)
+        .zoomAccess(false)
+        .mediaPlayGestureAccess(false)
+        .cacheMode(CacheMode.None)
+        .userAgent('Mozilla/5.0 (Linux; Android 10; HarmonyOS) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Mobile Safari/537.36 XdyAndroid/' + this.appVersion)
+        .onPermissionRequest((event) => {
+          if (event && event.request) { event.request.grant(event.request.getAccessibleResource()); }
+        })
+        .onPageBegin(() => {
+          // 尽早注入全局 js2native 函数，桥接到 xdyAndroid._js2native
+          const script = 'if (typeof js2native === "undefined") { window.js2native = function(msgId, val) { if (window.xdyAndroid && window.xdyAndroid._js2native) { window.xdyAndroid._js2native(msgId, val); } }; }';
+          try {
+            const promise = this.webviewCtrl.runJavaScript(script);
+            if (promise && typeof promise.then === 'function') {
+              promise.then(() => {}).catch(() => {});
+            }
+          } catch (_e) {}
+        })
+        .onLoadIntercept((event) => {
+          if (!event) return false;
+          const url: string = event.data.getRequestUrl();
+          // 拦截管理后台跳转（H5退出时直接window.location.href，不经过type:1004消息）
+          // Android 端通过 shouldOverrideUrlLoading 关闭 Activity，我们在此拦截并重定向到登录页
+          if (url.indexOf('xdyui2.xuedianyun.com') >= 0) {
+            console.info('[XDY] 拦截管理页跳转: ' + url);
+            // H5 未经 1004 消息直接跳转退出，需在此处销毁 RTC 引擎，防止引擎残留导致重新进入时异常
+            if (!this.isOut) {
+              this.isOut = true;
+              this.joinChanneled = false;
+              this.isRefreshing = false;
+              if (this.rtcEngine) {
+                try {
+                  if (this.rtcHandler) { this.rtcEngine.removeEventHandler(this.rtcHandler); }
+                  this.rtcEngine.leaveChannel();
+                  // 不调 destroy，保持 native 引擎活跃，防止重进时 -7
+                } catch (_e) {}
+                this.rtcEngine = null;
+              }
+              this.reset();
+              console.info('[XDY] onLoadIntercept: RTC引擎已销毁，视图已清空');
+            }
+            try {
+              webview.WebCookieManager.clearAllCookiesSync();
+              // 当前页面还在 pclive 域，可清除 pclive 的 localStorage
+              const promise = this.webviewCtrl.runJavaScript('try{localStorage.clear();sessionStorage.clear();}catch(e){}');
+              if (promise && typeof promise.then === 'function') {
+                promise.then((_r: string) => {
+                  try {
+                    this.webviewCtrl.removeCache(true);
+                    this.webviewCtrl.loadUrl(this.homeUrl);
+                    console.info('[XDY] 已清除会话，重载登录页');
+                  } catch (e2) {
+                    console.warn('[XDY] loadUrl err: ' + String(e2));
+                  }
+                }).catch(() => {
+                  try { this.webviewCtrl.loadUrl(this.homeUrl); } catch (_e2) {}
+                });
+              }
+            } catch (e) {
+              try { this.webviewCtrl.loadUrl(this.homeUrl); } catch (_e2) {}
+            }
+            return true; // 阻断跳转到管理页
+          }
+          return false;
+        })
+        .backgroundColor(Color.Black)
+      // 视频浮层（XComponent叠加在WebView上）
+      // 与安卓端一致：XComponent 始终保持配置尺寸（surfaceId 尺寸正确），通过 opacity=0 隐藏空闲槽位
+      Stack({ alignContent: Alignment.TopStart }) {
+        ForEach(this.playerViews, (pv: PlayerViewInfo) => {
+          VideoItemView({
+            pv: pv,
+            onSurfaceReady: (vid: string, surfaceId: string) => { this.onSurfaceReady(vid, surfaceId); }
+          })
+        }, (pv: PlayerViewInfo) => pv.vid)
+      }
+      .width('100%')
+      .height('100%')
+      .hitTestBehavior(HitTestMode.Transparent)
+      .zIndex(10)
+    }
+    .width('100%')
+    .height('100%')
+    .backgroundColor(Color.Black)
+  }
+
+  // ===== JS Bridge 消息分发 =====
+  onJs2Native(messageId: string, val: string): void {
+    console.info('[XDY] onJs2Native: messageId=' + messageId + ', val=' + val);
+    
+    // 照抄Android端: js2Native方法处理refresh和quit
+    if (messageId === 'refresh' || messageId === 'openRefresh') {
+      this.handleRefresh();
+      return;
+    }
+    if (messageId === 'quit') {
+      // quit消息: 退出课堂，销毁RTC并重置
+      if (this.isOut) {
+        console.info('[XDY] onJs2Native quit: isOut=true，跳过');
+        return;
+      }
+      this.isOut = true;
+      if (this.rtcEngine) {
+        try {
+          if (this.rtcHandler) { this.rtcEngine.removeEventHandler(this.rtcHandler); }
+          this.rtcEngine.leaveChannel();
+          // 不调 destroy，保持 native 引擎活跃，防止重进时 -7
+        } catch (_e) {}
+        this.rtcEngine = null;
+      }
+      this.reset();
+      try {
+        webview.WebCookieManager.clearAllCookiesSync();
+        this.webviewCtrl.runJavaScript('try{localStorage.clear();sessionStorage.clear();}catch(e){}');
+        this.webviewCtrl.removeCache(true);
+        this.webviewCtrl.loadUrl(this.homeUrl);
+      } catch (_e) {}
+      return;
+    }
+    if (messageId === 'video_broadcast') {
+      this.handleVideoBroadcast(val);
+      return;
+    }
+    if (messageId === 'setScreenShareView') {
+      this.handleSetScreenShareView(val);
+      return;
+    }
+    if (messageId === 'playLive') {
+      this.handlePlayLive(val);
+      return;
+    }
+    if (messageId === 'stopPlayLive') {
+      this.handleStopPlayLive(val);
+      return;
+    }
+    if (messageId === 'publishScreenShare') {
+      console.info('[XDY] publishScreenShare: 学生端不支持屏幕共享发起');
+      return;
+    }
+    if (messageId === 'stopPublishScreenShare') {
+      console.info('[XDY] stopPublishScreenShare: 学生端不支持停止屏幕共享');
+      return;
+    }
+    if (messageId === 'screen_share_play') {
+      this.handleScreenSharePlay(val);
+      return;
+    }
+    if (messageId === 'screen_share_stop') {
+      this.handleScreenShareStop(val);
+      return;
+    }
+    if (messageId === 'video_stop') {
+      // 检查是否是屏幕共享的 video_stop
+      try {
+        const stopData = JSON.parse(val) as Record<string, Object>;
+        const stopNodeId: number = stopData['fromNodeId'] as number;
+        for (const pv of this.playerViews) {
+          if (pv.vid === 'mScreenShareView' && pv.userId === stopNodeId && pv.isPlaying) {
+            this.handleScreenShareStop(val);
+            break;
+          }
+        }
+      } catch (e) {}
+      return;
+    }
+    if (messageId !== 'nativeWebRtcAction') return;
+    try {
+      const jo = JSON.parse(val) as JsMsgRoot;
+      const msgType: string = jo.type !== undefined && jo.type !== null ? String(jo.type) : '';
+      const msgData: string = typeof jo.data === 'object' ? JSON.stringify(jo.data) : (jo.data !== undefined && jo.data !== null ? String(jo.data) : '');
+      const msgName: string = jo.name !== undefined && jo.name !== null ? String(jo.name) : '';
+      const iMsgType: number = parseInt(msgType);
+      if (iMsgType > 1004 && !this.joinChanneled && iMsgType < 1009) return;
+      switch (msgType) {
+        case '1000': this.handleLoadWebView(msgData); break;
+        case '1001': this.handleUserView(msgData); break;
+        case '1002': this.handleUserList(msgData); break;
+        case '1003': this.handleJoinChannel(msgData, msgName); break;
+        case '1004': this.handleLeaveChannel(msgData); break;
+        case '1005': this.handlePushStream(msgData); break;
+        case '1006': this.handleMuteVideo(msgData); break;
+        case '1007': this.handleMuteAudio(msgData); break;
+        case '1008': this.handleCancelStream(msgData); break;
+        case '1009': this.handleSysInfo(); break;
+        case '1010': this.handleDeviceInfo(); break;
+        case '1014': this.handleUpDownStage(msgData); break;
+        case '1015': this.handleSwitchCamera(); break;
+        case '1020': this.handleVolume(msgData); break;
+        case '1051': this.handleWebDialog(msgData); break;
+        case '1052': this.handleClassInfo(msgData); break;
+        default: break;
+      }
+    } catch (e) {
+      console.error('[XDY] js2native err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // 1000 WebView加载
+  handleLoadWebView(msgData: string): void {
+    console.info('[XDY] handleLoadWebView: msgData=' + msgData);
+    // 收到 1000 initNativeApp 消息代表 H5 已重新加载，必须重置 isOut 确保后续加入频道不被拦截
+    this.isOut = false;
+    this.native2Js('2000', 0, '加载webview', '{"os":"android"}');
+    // H5 应用层已就绪，注入屏幕共享 API Hook
+    this.injectScreenShareHook();
+  }
+
+  // 注入 JS Hook：拦截 xdysdk.api 中屏幕共享相关调用，转发到 native bridge
+  injectScreenShareHook(): void {
+    const script: string = '(function(){' +
+      'if(window._xdyApiHooked)return;' +
+      'window._xdyApiHooked=true;' +
+      'function hookXdySdk(){' +
+        'if(typeof xdysdk==="undefined"||!xdysdk||!xdysdk.api){' +
+          'setTimeout(hookXdySdk,200);return;' +
+        '}' +
+        'var originalApi=xdysdk.api.bind(xdysdk);' +
+        'xdysdk.api=function(name,params){' +
+          'if(name==="playLive"||name==="stopPlayLive"||name==="setScreenShareView"){' +
+            'console.log("[XDY-Hook] xdysdk.api intercepted: "+name+", params="+JSON.stringify(params));' +
+            'try{js2native(name,JSON.stringify(params||{}));}' +
+            'catch(e){console.error("[XDY-Hook] js2native error: "+e.message);}' +
+            'return;' +
+          '}' +
+          'return originalApi(name,params);' +
+        '};' +
+        'console.log("[XDY-Hook] xdysdk.api hooked for screenShare");' +
+      '}' +
+      'hookXdySdk();' +
+    '})();';
+    try {
+      const promise = this.webviewCtrl.runJavaScript(script);
+      if (promise && typeof promise.then === 'function') {
+        promise.then(() => {
+          console.info('[XDY] injectScreenShareHook: 注入成功');
+        }).catch((e: Error) => {
+          console.error('[XDY] injectScreenShareHook: 注入失败 ' + e.message);
+        });
+      }
+    } catch (e) {
+      console.error('[XDY] injectScreenShareHook err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // 1001 用户视图布局 - 照抄Android端逻辑
+  handleUserView(data: string): void {
+    try {
+      const jo = JSON.parse(data) as ViewCellListData;
+      const list: ViewCellData[] = jo.list ?? [];
+      const sw: number = this.screenWidth;
+      console.info('[XDY] handleUserView: screenWidthPx=' + sw + ', listCount=' + list.length + ', playerViews.length=' + this.playerViews.length);
+      
+      // Android端: layoutUserView() 如果视图已存在则直接返回
+      if (this.playerViews.length > 0) {
+        console.info('[XDY] handleUserView: 视图已存在，跳过重建');
+        return;
+      }
+      
+      const views: PlayerViewInfo[] = [];
+      for (const vc of list) {
+        const leftPx: number = Math.ceil(sw * vc.left * 0.01);
+        const topPx: number = Math.ceil(sw * vc.top * 0.01);
+        const widthPx: number = Math.ceil(sw * vc.width * 0.01);
+        const heightPx: number = Math.ceil(sw * vc.height * 0.01);
+        const radiusPx: number = Math.ceil(sw * vc.radius * 0.01);
+
+        const pv = new PlayerViewInfo();
+        pv.vid = vc.id;
+        pv.userId = 0;
+        pv.userRole = vc.userRole;
+        pv.userName = '';
+        pv.isPlaying = false;
+        pv.surfaceId = '';
+        pv.audioMuted = false;
+        pv.videoMuted = false;
+        pv.channelId = '';
+        pv.left = leftPx;
+        pv.top = topPx;
+        pv.width = widthPx;
+        pv.height = heightPx;
+        pv.radius = radiusPx;
+        pv.visible = false;
+        pv.volumeBtn = vc.volumeBtn;
+        pv.zoomBtn = vc.zoomBtn;
+        views.push(pv);
+      }
+      this.playerViews = views;
+      console.info('[XDY] handleUserView: 创建了 ' + views.length + ' 个视图');
+    } catch (e) {
+      console.error('[XDY] handleUserView err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // 1002 用户列表
+  handleUserList(data: string): void {
+    try {
+      const jo = JSON.parse(data) as MemberListData;
+      const list: MemberInfo[] = jo.list ?? [];
+      for (const m of list) {
+        this.memberMap.set(m.uid, m);
+        
+        // 如果有缓存的 rtcModel，说明首帧已到，但当时没有 memberInfo。现在有了，立即推流绑定。
+        const rtcModel = this.rtcModelMap.get(m.uid);
+        if (rtcModel && this.joinChanneled) {
+          let found = false;
+          for (const pv of this.playerViews) {
+            if (pv.userId === m.uid) {
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            const hasVideo = rtcModel.videoMute === 0;
+            const hasAudio = rtcModel.audioMute === 0;
+            if (hasVideo || hasAudio) {
+              // 从 memberMap 获取 userRole 和 userName
+              const userRole = m.userRole ?? 'normal';
+              const userName = m.userName ?? '';
+              this.pushStream(m.uid, hasVideo, hasAudio, this.channelId, userRole, userName);
+            }
+          }
+        }
+        
+        // 刷新后：如果成员已经开摄像头/麦克风，但还没有绑定视图，主动推流
+        // openCamera/openMicrophones 是时间戳，大于0表示已开启
+        if (this.joinChanneled && m.uid !== this.selfUid) {
+          let found = false;
+          for (const pv of this.playerViews) {
+            if (pv.userId === m.uid) {
+              found = true;
+              break;
+            }
+          }
+          if (!found && (m.openCamera > 0 || m.openMicrophones > 0)) {
+            const userRole = m.userRole ?? 'normal';
+            const userName = m.userName ?? '';
+            console.info('[XDY] handleUserList: 成员已开音视频，主动推流 uid=' + m.uid + ', userRole=' + userRole);
+            this.pushStream(m.uid, m.openCamera > 0, m.openMicrophones > 0, this.channelId, userRole, userName);
+          }
+        }
+      }
+    } catch (e) {
+      console.error('[XDY] handleUserList err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // 1003 加入频道 - 照抄Android端逻辑
+  handleJoinChannel(data: string, name: string): void {
+    console.info('[XDY] handleJoinChannel: data=' + data + ', name=' + name);
+    try {
+      const jo = JSON.parse(data) as JoinChannelData;
+
+      // 重置刷新标志
+      this.isRefreshing = false;
+      this.isOut = false;
+
+      if (name === '加入频道') {
+        // 引擎已存在则直接跳过 doJoinChannel，避免重复销毁/重建：
+        //   ① 刷新场景：reset() 不销毁引擎，刷新后 H5 重发 1003，此时引擎仍活着
+        //   ② 重复 1003：H5 在加入中（joinChanneled=false）快速重发，引擎已创建未完成
+        // 对齐安卓端：关闭/重建 Activity 保证每次进入时引擎为 null；
+        // 鸿蒙端以 rtcEngine 是否为 null 作为等价判断
+        if (this.rtcEngine) {
+          if (this.joinChanneled && jo.channelId === this.channelId) {
+            // 刷新场景：引擎活着且已在频道。补发 join 回调让 H5 知道我们已在频道，停止重试 1003。
+            console.info('[XDY] handleJoinChannel: 刷新场景，已在频道，补发 join 回调 uid=' + jo.uid);
+            this.selfUid = jo.uid;
+            const refreshJoinData = '{"uid":' + this.selfUid + ',"type":"1003"}';
+            const refreshScript = 'js2native("join",\'' + refreshJoinData + '\')';
+            try { this.webviewCtrl.runJavaScript(refreshScript); } catch (_e) {}
+          } else {
+            console.warn('[XDY] handleJoinChannel: 引擎已存在未完成加入，跳过重复 1003 uid=' + jo.uid);
+          }
+          return;
+        }
+        this.selfUid = jo.uid;
+        // 回调JS - 与Android端一致
+        const joinData = '{"uid":' + this.selfUid + ',"type":"1003"}';
+        const script = 'js2native("join",\'' + joinData + '\')';
+        try { this.webviewCtrl.runJavaScript(script); } catch (_e) {}
+        this.doJoinChannel(jo.channelId, jo.uid, jo.appId, jo.domain, jo.secretKey,
+          jo.sdkType, jo.channelMode, jo.channelKey, jo.videoProfile, jo.videoDynamicSubscribe);
+      } else {
+        this.selfUid = jo.uid;
+        const joinData = '{"uid":' + this.selfUid + ',"type":"1003"}';
+        const script = 'js2native("join",\'' + joinData + '\')';
+        try { this.webviewCtrl.runJavaScript(script); } catch (_e) {}
+      }
+    } catch (e) {
+      console.error('[XDY] handleJoinChannel err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // 1004 离开频道 - 完全照抄Android端逻辑
+  handleLeaveChannel(data: string): void {
+    console.info('[XDY] handleLeaveChannel: data=' + data);
+    
+    // Android端: handelWebLeaveChannel() 开头检查 isOut
+    if (this.isOut) {
+      console.info('[XDY] handleLeaveChannel: isOut=true，跳过');
+      return;
+    }
+    
+    try {
+      const jo = JSON.parse(data) as LeaveChannelData;
+      const action = jo.action ?? 'leave';
+      
+      // 回调JS
+      const script = 'js2native("' + action + '",\'' + data + '\')';
+      try {
+        this.webviewCtrl.runJavaScript(script);
+      } catch (_e) {}
+      
+      // 刷新操作：只调用reset()，不销毁RTC，不退出频道 - 与Android端一致
+      if (action === 'refresh') {
+        this.reset();
+        return;
+      }
+    } catch (e) {
+      console.warn('[XDY] handleLeaveChannel parse warn');
+    }
+    
+    // 退出课堂：设置isOut标志，防止重复执行
+    this.isOut = true;
+    this.joinChanneled = false;
+    this.isExiting = true;
+    this.isRefreshing = false;
+    
+    // 退出课堂：只调 leaveChannel，不 destroy。
+    // 原因：RtcNapi.destroySync() 在 HarmonyOS 上不可靠，
+    // native 引擎实际未清理，重进时 RtcNapi.initialize() 失败返回 -7；
+    // 保持引擎活跃（initialized=true），重进时复用引擎直接 joinChannel 即可。
+    if (this.rtcEngine) {
+      try {
+        this.rtcEngine.muteLocalVideoStream(true);
+        this.rtcEngine.muteLocalAudioStream(true);
+        if (this.rtcHandler) {
+          this.rtcEngine.removeEventHandler(this.rtcHandler);
+        }
+        this.rtcEngine.leaveChannel();
+      } catch (_e) {}
+      this.rtcEngine = null;
+    }
+    
+    // 调用reset清空视图和数据
+    this.reset();
+    
+    console.info('[XDY] handleLeaveChannel: RTC已销毁，视频视图已清空');
+    
+    // 清除session并重载登录页
+    try {
+      webview.WebCookieManager.clearAllCookiesSync();
+      this.webviewCtrl.runJavaScript('try{localStorage.clear();sessionStorage.clear();}catch(e){}');
+      this.webviewCtrl.removeCache(true);
+      this.webviewCtrl.loadUrl(this.homeUrl);
+      console.info('[XDY] 退出课堂，已清除 localStorage + cookie，重载登录页');
+    } catch (e) {
+      console.warn('[XDY] exit redirect err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // reset() - 完全照抄Android端逻辑：销毁视图、清空数组、清空数据
+  reset(): void {
+    console.info('[XDY] reset: 清空视图和数据');
+    
+    // 停止本地推流 - 解决刷新后旧轨道资源未释放的问题
+    if (this.rtcEngine) {
+      try {
+        console.info('[XDY] reset: 停止本地音视频推流');
+        this.rtcEngine.muteLocalVideoStream(true);
+        this.rtcEngine.muteLocalAudioStream(true);
+      } catch (_e) {
+        console.warn('[XDY] reset: 停止推流失败 ' + String(_e));
+      }
+    }
+    
+    // 解除所有视频绑定
+    if (this.rtcEngine) {
+      for (const pv of this.playerViews) {
+        if (pv.surfaceId && pv.userId > 0) {
+          try {
+            const up: UserParam = new UserParam(pv.userId);
+            if (pv.userId === this.selfUid) {
+              this.rtcEngine.setLocalVideo(pv.surfaceId, false, RenderMode.RENDER_MODE_HIDDEN, up);
+            } else {
+              this.rtcEngine.setRemoteVideo(pv.surfaceId, false, RenderMode.RENDER_MODE_HIDDEN, up);
+            }
+            console.info('[XDY] reset: 解除视频绑定 vid=' + pv.vid + ', uid=' + pv.userId);
+          } catch (_e) {}
+        }
+      }
+    }
+    
+    // 完全清空视图数组 - 与Android端一致：viewList.clear()
+    // 这样ForEach会重新创建所有VideoItemView，触发XComponent.onLoad获取新的surfaceId
+    this.playerViews = [];
+    console.info('[XDY] reset: playerViews已清空');
+    
+    // 清空数据
+    this.memberMap.clear();
+    this.rtcModelMap.clear();
+    this.remoteStatsMap.clear();
+    console.info('[XDY] reset: 完成');
+  }
+
+  // 刷新页面 - 与Android端一致：只调用reset()，然后刷新WebView
+  handleRefresh(): void {
+    console.info('[XDY] handleRefresh: 页面刷新');
+    // 防止重复刷新
+    if (this.isRefreshing) {
+      console.info('[XDY] handleRefresh: 已在刷新中，跳过');
+      return;
+    }
+    this.isRefreshing = true;
+    this.isOut = false;  // 重置isOut，允许重新加入
+    
+    // 只调用reset()，不销毁RTC - 与Android端一致
+    this.reset();
+    
+    // 刷新 WebView
+    try {
+      this.webviewCtrl.refresh();
+    } catch (e) {
+      console.warn('[XDY] handleRefresh refresh err: ' + String(e));
+    }
+  }
+
+  // 1005 推流
+  handlePushStream(data: string): void {
+    try {
+      const jo = JSON.parse(data) as PushStreamData;
+      // 优先使用消息中的 userRole，如果没有则从 memberMap 获取
+      const userRole = jo.userRole || (this.memberMap.get(jo.uid)?.userRole ?? 'normal');
+      console.info('[XDY] handlePushStream: uid=' + jo.uid + ', userRole=' + userRole + ', video=' + jo.video + ', audio=' + jo.audio);
+      this.pushStream(jo.uid, jo.video, jo.audio, this.channelId, userRole, jo.userName);
+    } catch (e) {
+      console.error('[XDY] handlePushStream err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // 1006 静音视频
+  handleMuteVideo(data: string): void {
+    try {
+      const jo = JSON.parse(data) as MuteData;
+      const uid: number = jo.uid; const mute: boolean = jo.mute;
+      if (uid === this.selfUid && this.rtcEngine) {
+        if (mute) {
+          // 停止采集
+          this.rtcEngine.enableLocalVideo(false);
+          // 解除本地视图绑定
+          const up: UserParam = new UserParam(uid);
+          for (const pv of this.playerViews) {
+            if (pv.userId === uid) {
+              this.rtcEngine.setLocalVideo(pv.surfaceId, false, RenderMode.RENDER_MODE_HIDDEN, up);
+              // 保持visible=true，由videoMuted黑色遮罩覆盖
+            }
+          }
+          // 停止发送视频流
+          this.rtcEngine.muteLocalVideoStream(true);
+          this.native2Js('2006', 0, '推流关闭视频', '{"uid":' + uid + ',"mute":true}');
+        } else {
+          // 恢复采集
+          this.rtcEngine.enableLocalVideo(true);
+          // 取消静音
+          this.rtcEngine.muteLocalVideoStream(false);
+          // 重新绑定本地视频surface（恢复本地预览）
+          const up: UserParam = new UserParam(uid);
+          for (const pv of this.playerViews) {
+            if (pv.userId === uid && pv.surfaceId) {
+              this.rtcEngine.setLocalVideo(pv.surfaceId, true, RenderMode.RENDER_MODE_HIDDEN, up);
+              pv.visible = true;
+              console.info('[XDY] handleMuteVideo: 重新绑定本地视频 uid=' + uid + ' surfaceId=' + pv.surfaceId);
+            }
+          }
+          this.native2Js('2006', 0, '推流开启视频', '{"uid":' + uid + ',"mute":false}');
+        }
+      }
+      const mi = this.memberMap.get(uid);
+      if (mi) { mi.videoMuted = mute; this.memberMap.set(uid, mi); }
+      for (const pv of this.playerViews) {
+        if (pv.userId === uid) {
+          pv.videoMuted = mute;
+        }
+      }
+    } catch (e) {
+      console.error('[XDY] handleMuteVideo err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // 1007 静音音频
+  handleMuteAudio(data: string): void {
+    try {
+      const jo = JSON.parse(data) as MuteData;
+      const uid: number = jo.uid; const mute: boolean = jo.mute;
+      if (uid === this.selfUid && this.rtcEngine) {
+        let success: number = -1;
+        if (mute) {
+          success = this.rtcEngine.muteLocalAudioStream(true);
+        } else {
+          // 开启麦克风：先取消静音
+          success = this.rtcEngine.muteLocalAudioStream(false);
+          // 检查是否需要绑定视图（刷新后视图可能未绑定）
+          let hasBoundView = false;
+          for (const pv of this.playerViews) {
+            if (pv.userId === uid && pv.isPlaying) {
+              hasBoundView = true;
+              break;
+            }
+          }
+          if (!hasBoundView) {
+            // 没有绑定视图，需要重新推流绑定
+            const mi = this.memberMap.get(uid);
+            const userRole = mi?.userRole ?? 'normal';
+            const userName = mi?.userName ?? '';
+            console.info('[XDY] handleMuteAudio: 本地用户未绑定视图，重新推流 uid=' + uid);
+            this.pushStream(uid, true, true, this.channelId, userRole, userName);
+          }
+        }
+        this.native2Js('2007', success >= 0 ? 0 : 1, '推流开关音频', '{"uid":' + uid + ',"mute":' + (mute ? 'true' : 'false') + '}');
+      }
+      const mi = this.memberMap.get(uid);
+      if (mi) { mi.audioMuted = mute; this.memberMap.set(uid, mi); }
+      for (const pv of this.playerViews) {
+        if (pv.userId === uid) {
+          pv.audioMuted = mute;
+        }
+      }
+    } catch (e) {
+      console.error('[XDY] handleMuteAudio err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // 1008 取消推流
+  handleCancelStream(data: string): void {
+    try {
+      const jo = JSON.parse(data) as CancelStreamData;
+      this.cancelStream(jo.uid, this.channelId);
+    } catch (e) {
+      console.error('[XDY] handleCancelStream err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // video_broadcast: 老师端发起的推流/取消推流控制（与 Android 端对齐）
+  // actionType=1: 开启本端推流；actionType=0: 关闭本端推流
+  handleVideoBroadcast(val: string): void {
+    try {
+      const jo = JSON.parse(val) as Record<string, Object>;
+      const toNodeId: number = jo['toNodeId'] as number;
+      const actionType: number = jo['actionType'] as number;
+      // 只处理发给本设备用户的消息
+      if (toNodeId !== this.selfUid || !this.joinChanneled) {
+        console.info('[XDY] video_broadcast: 忽略 toNodeId=' + toNodeId + ' (selfUid=' + this.selfUid + ', joinChanneled=' + this.joinChanneled + ')');
+        return;
+      }
+      console.info('[XDY] video_broadcast: actionType=' + actionType + ', toNodeId=' + toNodeId);
+      if (actionType === 1) {
+        // 开启本端音视频并推流
+        const mi = this.memberMap.get(this.selfUid);
+        const userRole: string = mi?.userRole ?? 'normal';
+        const userName: string = mi?.userName ?? '';
+        this.pushStream(this.selfUid, true, true, this.channelId, userRole, userName);
+      } else if (actionType === 0) {
+        // 关闭本端推流
+        this.cancelStream(this.selfUid, this.channelId);
+      } else if (actionType === 2) {
+        // Web端发送的停止推流
+        this.cancelStream(this.selfUid, this.channelId);
+      }
+    } catch (e) {
+      console.error('[XDY] handleVideoBroadcast err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // ===== 屏幕共享相关处理 =====
+
+  // setScreenShareView: 存储屏幕共享配置信息
+  // screen_share_play: 订阅屏幕共享流（通过识别不在memberMap中的远端UID）
+  handleScreenSharePlay(val: string): void {
+    try {
+      const data = JSON.parse(val) as Record<string, Object>;
+      const fromNodeId: number = data['fromNodeId'] as number;
+      const mediaType: number = (data['mediaType'] as number) ?? 0;
+
+      console.info('[XDY] handleScreenSharePlay: fromNodeId=' + fromNodeId + ', mediaType=' + mediaType);
+
+      this.screenSharePending = true;
+      this.screenShareFromNodeId = fromNodeId;
+
+      if (!this.rtcEngine || !this.joinChanneled) {
+        console.warn('[XDY] handleScreenSharePlay: rtcEngine或joinChanneled未就绪，等待用户加入后自动订阅');
+        return;
+      }
+
+      // 查找已加入但不在memberMap中的UID（即屏幕共享流UID）
+      let screenShareUid: number = 0;
+      this.rtcModelMap.forEach((_model: RtcModelInfo, uid: number) => {
+        if (!this.memberMap.has(uid) && uid !== this.selfUid) {
+          screenShareUid = uid;
+        }
+      });
+
+      if (screenShareUid > 0) {
+        this.subscribeScreenShare(screenShareUid);
+      } else {
+        console.info('[XDY] handleScreenSharePlay: 屏幕共享UID尚未加入，等待onUserJoined/onFirstRemoteVideo');
+      }
+    } catch (e) {
+      console.error('[XDY] handleScreenSharePlay err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // 订阅屏幕共享流到 mScreenShareView
+  subscribeScreenShare(uid: number): void {
+    for (const pv of this.playerViews) {
+      if (pv.vid === 'mScreenShareView' && pv.surfaceId && this.rtcEngine) {
+        const up: UserParam = new UserParam(uid);
+        this.rtcEngine.setRemoteVideo(pv.surfaceId, true, RenderMode.RENDER_MODE_FIT, up);
+        pv.userId = uid;
+        pv.isPlaying = true;
+        pv.visible = true;
+        this.screenSharePending = false;
+        console.info('[XDY] subscribeScreenShare: 订阅屏幕共享成功 uid=' + uid + ', surfaceId=' + pv.surfaceId);
+        break;
+      }
+    }
+  }
+
+  // screen_share_stop: 停止屏幕共享订阅
+  handleScreenShareStop(val: string): void {
+    try {
+      const data = JSON.parse(val) as Record<string, Object>;
+      const fromNodeId: number = data['fromNodeId'] as number;
+
+      console.info('[XDY] handleScreenShareStop: fromNodeId=' + fromNodeId);
+
+      // 找到 mScreenShareView 视图并取消订阅
+      for (const pv of this.playerViews) {
+        if (pv.vid === 'mScreenShareView' && pv.surfaceId && this.rtcEngine) {
+          const up: UserParam = new UserParam(pv.userId > 0 ? pv.userId : fromNodeId);
+          this.rtcEngine.setRemoteVideo(pv.surfaceId, false, RenderMode.RENDER_MODE_FIT, up);
+          pv.userId = 0;
+          pv.isPlaying = false;
+          pv.visible = false;
+          console.info('[XDY] handleScreenShareStop: 取消屏幕共享订阅成功');
+          break;
+        }
+      }
+      this.screenSharePending = false;
+      this.screenShareFromNodeId = 0;
+    } catch (e) {
+      console.error('[XDY] handleScreenShareStop err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  handleSetScreenShareView(val: string): void {
+    try {
+      const jo = JSON.parse(val) as ScreenShareViewData;
+      this.screenShareDivId = jo.divId ?? '';
+      this.screenShareVolume = jo.volume ?? 0;
+      console.info('[XDY] handleSetScreenShareView: divId=' + this.screenShareDivId + ', volume=' + this.screenShareVolume);
+    } catch (e) {
+      console.error('[XDY] handleSetScreenShareView err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // playLive: 学生端接收老师屏幕共享
+  handlePlayLive(val: string): void {
+    try {
+      const jo = JSON.parse(val) as PlayLiveData;
+      const nodeId: number = jo.nodeId;
+      const url: string = jo.url ?? '';
+      console.info('[XDY] handlePlayLive: nodeId=' + nodeId + ', url=' + url);
+
+      if (!this.rtcEngine || !this.joinChanneled) {
+        console.warn('[XDY] handlePlayLive: rtcEngine或joinChanneled未就绪，忽略');
+        return;
+      }
+
+      // 检查是否已经有该nodeId绑定的视图
+      for (const pv of this.playerViews) {
+        if (pv.userId === nodeId && pv.isPlaying) {
+          console.info('[XDY] handlePlayLive: nodeId=' + nodeId + ' 已在播放，跳过');
+          return;
+        }
+      }
+
+      // 寻找空闲的playerView（userId === 0 且 surfaceId 存在）
+      let targetPv: PlayerViewInfo | null = null;
+      for (const pv of this.playerViews) {
+        if (pv.userId === 0 && pv.surfaceId && !pv.isPlaying) {
+          targetPv = pv;
+          break;
+        }
+      }
+
+      if (!targetPv) {
+        console.warn('[XDY] handlePlayLive: 未找到空闲视图用于屏幕共享 nodeId=' + nodeId);
+        return;
+      }
+
+      // 订阅远端屏幕共享视频流
+      const up: UserParam = new UserParam(nodeId);
+      this.rtcEngine.setRemoteVideo(targetPv.surfaceId, true, RenderMode.RENDER_MODE_FIT, up);
+      targetPv.userId = nodeId;
+      targetPv.isPlaying = true;
+      targetPv.visible = true;
+      targetPv.userName = '屏幕共享';
+      console.info('[XDY] handlePlayLive: 屏幕共享订阅成功 nodeId=' + nodeId + ' -> vid=' + targetPv.vid);
+    } catch (e) {
+      console.error('[XDY] handlePlayLive err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // stopPlayLive: 停止接收屏幕共享
+  handleStopPlayLive(val: string): void {
+    try {
+      const jo = JSON.parse(val) as PlayLiveData;
+      const nodeId: number = jo.nodeId;
+      console.info('[XDY] handleStopPlayLive: nodeId=' + nodeId);
+
+      if (!this.rtcEngine) {
+        console.warn('[XDY] handleStopPlayLive: rtcEngine未就绪，忽略');
+        return;
+      }
+
+      // 根据nodeId找到对应的playerView并取消订阅
+      for (const pv of this.playerViews) {
+        if (pv.userId === nodeId) {
+          const up: UserParam = new UserParam(nodeId);
+          this.rtcEngine.setRemoteVideo(pv.surfaceId, false, RenderMode.RENDER_MODE_FIT, up);
+          pv.userId = 0;
+          pv.isPlaying = false;
+          pv.visible = false;
+          pv.userName = '';
+          console.info('[XDY] handleStopPlayLive: 屏幕共享取消订阅成功 nodeId=' + nodeId + ', vid=' + pv.vid);
+          break;
+        }
+      }
+    } catch (e) {
+      console.error('[XDY] handleStopPlayLive err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // 1009 系统信息
+  handleSysInfo(): void {
+    this.native2Js('2009', 0, '系统信息', '{"memoryUsage":100,"memory":2048,"volumeGain":0}');
+  }
+
+  // 1010 设备信息
+  async handleDeviceInfo(): Promise<void> {
+    try {
+      const disp = display.getDefaultDisplaySync();
+      const pw: number = disp.width;
+      const ph: number = disp.height;
+      // dpi 使用密度比率（Android 标准：densityDPI / 160），与 Android 端一致
+      const dpiRatio: number = disp.densityDPI / 160;
+      const mw: number = Math.max(pw, ph);
+      const mh: number = Math.min(pw, ph);
+
+      // 真实设备信息
+      const sysName: string = 'HarmonyOS';
+      const sysVersion: string = deviceInfo.osFullName ?? 'unknown';
+      const modelName: string = deviceInfo.productModel ?? 'unknown';
+      const brand: string = deviceInfo.brand ?? 'unknown';
+      const devType: string = deviceInfo.deviceType ?? 'unknown';
+      const sdkApi: number = deviceInfo.sdkApiVersion ?? 0;
+
+      // 动态获取音量
+      let systemMaxVol: number = 7;
+      let systemCurVol: number = 0;
+      let musicMaxVol: number = 15;
+      let musicCurVol: number = 2;
+      try {
+        const sysVolMgr = audio.getAudioManager().getVolumeManager();
+        const sysGrpMgr = await sysVolMgr.getVolumeGroupManager(audio.DEFAULT_VOLUME_GROUP_ID);
+        systemMaxVol = sysGrpMgr.getMaxVolumeSync(audio.AudioVolumeType.RINGTONE);
+        systemCurVol = sysGrpMgr.getVolumeSync(audio.AudioVolumeType.RINGTONE);
+        musicMaxVol = sysGrpMgr.getMaxVolumeSync(audio.AudioVolumeType.MEDIA);
+        musicCurVol = sysGrpMgr.getVolumeSync(audio.AudioVolumeType.MEDIA);
+      } catch (_volErr) {
+        console.warn('[XDY] 获取音量信息失败，使用默认值');
+      }
+
+      // 获取 CPU 核心数和总内存（HarmonyOS 无直接公开 API，使用 deviceInfo 可获取字段）
+      let cpuCores: number = 0;
+      let totalRam: number = 0;
+      try {
+        // HarmonyOS 无公开 totalRam/cpuCores API，通过可用属性推断或使用默认值
+        cpuCores = 4; // 无公开 API，给合理默认值
+        totalRam = 0; // 无公开 API，由服务端忽略 0 值
+      } catch (_e) {}
+
+      const info: string = '{"rtcSdk":{"agoraRtc":"4.3.2.17"},' +
+        '"deviceSysName":"' + sysName + '","deviceSysVersion":"' + sysVersion + '","deviceModelName":"' + modelName + '",' +
+        '"brand":"' + brand + '","deviceType":"' + devType + '","sdkApiVersion":' + sdkApi + ',' +
+        '"totalRam":' + totalRam + ',"cpuCores":' + cpuCores + ',' +
+        '"deviceWidth":' + mw + ',"deviceWidth1":' + mw + ',"deviceWidth2":' + mw +
+        ',"deviceWidth3":' + mw + ',"deviceWidth4":' + mw + ',"deviceWidth5":' + mw + ',' +
+        '"deviceHeight":' + mh + ',"deviceHeight1":' + mh + ',"deviceHeight2":' + mh +
+        ',"deviceHeight3":' + mh + ',"deviceHeight4":' + mh + ',"deviceHeight5":' + mh + ',' +
+        '"dpi":' + dpiRatio + ',' +
+        '"systemMaxVolume":' + systemMaxVol + ',"systemCurrentVolume":' + systemCurVol +
+        ',"musicMaxVolume":' + musicMaxVol + ',"musicCurrentVolume":' + musicCurVol + ',' +
+        '"appName":"学点云课堂","appVersion":"' + this.appVersion + '","sdkVersion":"' + ClassroomView.SDK_VERSION + '","appBuild":' + this.appBuild + '}';
+      this.native2Js('2010', 0, '设备信息', info);
+    } catch (e) {
+      const verPart: string = '"appName":"学点云课堂","appVersion":"' +
+        this.appVersion + '","sdkVersion":"' + ClassroomView.SDK_VERSION + '","appBuild":' + this.appBuild + '}';
+      this.native2Js('2010', 0, '设备信息',
+        '{"rtcSdk":{"agoraRtc":"4.3.2.17"},' +
+        '"deviceSysName":"HarmonyOS","deviceSysVersion":"unknown","deviceModelName":"unknown",' +
+        '"brand":"unknown","deviceType":"unknown","sdkApiVersion":0,' +
+        '"totalRam":0,"cpuCores":0,' +
+        '"deviceWidth":1280,"deviceWidth1":1280,"deviceWidth2":1280,"deviceWidth3":1280,"deviceWidth4":1280,"deviceWidth5":1280,' +
+        '"deviceHeight":800,"deviceHeight1":800,"deviceHeight2":800,"deviceHeight3":800,"deviceHeight4":800,"deviceHeight5":800,' +
+        '"dpi":2.5,' +
+        '"systemMaxVolume":7,"systemCurrentVolume":0,"musicMaxVolume":15,"musicCurrentVolume":2,' +
+        verPart);
+    }
+  }
+
+  // 1014 视频上台/下台
+  handleUpDownStage(data: string): void {
+    try {
+      const jo = JSON.parse(data) as UpDownStageData;
+      const list: UpDownStageItem[] = jo.list ?? [];
+
+      // 收集本次上台的 uid 列表
+      const upUidList: number[] = [];
+      for (const item of list) {
+        upUidList.push(item.nodeId);
+      }
+
+      // 上台处理
+      for (const item of list) {
+        const uid = item.nodeId;
+
+        // 检查是否已在 showstage 中
+        let alreadyUp = false;
+        for (const pv of this.playerViews) {
+          if (pv.userRole === 'showstage' && pv.upUserId === uid) {
+            alreadyUp = true;
+            break;
+          }
+        }
+        if (alreadyUp) continue;
+
+        // 找到 normal/host 角色中该 uid 对应的视图
+        let targetView: PlayerViewInfo | null = null;
+        let stageView: PlayerViewInfo | null = null;
+        for (const pv of this.playerViews) {
+          if ((pv.userRole === 'normal' || pv.userRole === 'host') && pv.userId === uid) {
+            targetView = pv;
+          }
+        }
+        for (const pv of this.playerViews) {
+          if (pv.userRole === 'showstage' && pv.upUserId === 0) {
+            stageView = pv;
+            break;
+          }
+        }
+
+        if (targetView !== null && stageView !== null && !targetView.isUp) {
+          // 保存原始位置
+          targetView.origLeft = targetView.left;
+          targetView.origTop = targetView.top;
+          targetView.origWidth = targetView.width;
+          targetView.origHeight = targetView.height;
+          targetView.origRadius = targetView.radius;
+          // 移动到 showstage 区域
+          targetView.left = stageView.left;
+          targetView.top = stageView.top;
+          targetView.width = stageView.width;
+          targetView.height = stageView.height;
+          targetView.radius = stageView.radius;
+          targetView.isUp = true;
+          // 标记 stageView 被占用
+          stageView.upUserId = uid;
+          console.info('[XDY] handleUpDownStage: 上台 uid=' + uid + ' -> showstage left=' + stageView.left + ',top=' + stageView.top);
+        }
+      }
+
+      // 下台处理：对不在 upUidList 中的已上台视图，恢复原位
+      for (const pv of this.playerViews) {
+        if ((pv.userRole === 'normal' || pv.userRole === 'host') && pv.isUp) {
+          let stillUp = false;
+          for (const id of upUidList) {
+            if (id === pv.userId) { stillUp = true; break; }
+          }
+          if (!stillUp) {
+            pv.left = pv.origLeft;
+            pv.top = pv.origTop;
+            pv.width = pv.origWidth;
+            pv.height = pv.origHeight;
+            pv.radius = pv.origRadius;
+            pv.isUp = false;
+            // 清除对应 stageView 的占用标记
+            for (const sv of this.playerViews) {
+              if (sv.userRole === 'showstage' && sv.upUserId === pv.userId) {
+                sv.upUserId = 0;
+              }
+            }
+            console.info('[XDY] handleUpDownStage: 下台 uid=' + pv.userId);
+          }
+        }
+      }
+
+      console.info('[XDY] handleUpDownStage: 上台用户数=' + list.length);
+    } catch (e) {
+      console.error('[XDY] handleUpDownStage err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // 1015 切换摄像头
+  handleSwitchCamera(): void {
+    if (!this.rtcEngine) return;
+    const result: number = this.rtcEngine.switchCamera();
+    this.native2Js('2015', result >= 0 ? 0 : 1, '切换摄像头', '{"label":"front"}');
+  }
+
+  // 1020 音量增益
+  handleVolume(data: string): void {
+    try {
+      const jo = JSON.parse(data) as VolumeData;
+      const value = jo.value ?? 0;
+      if (this.rtcEngine) {
+        let code = 0;
+        if (value > 100) {
+          code = this.rtcEngine.adjustPlaybackVolume(value);
+          this.native2Js('2020', code, '开启声音增益', '{"uid":' + this.selfUid + '}');
+        } else {
+          code = this.rtcEngine.adjustPlaybackVolume(101);
+          this.native2Js('2020', code, '关闭声音增益', '{"uid":' + this.selfUid + '}');
+        }
+      }
+    } catch (e) {
+      console.error('[XDY] handleVolume err');
+    }
+  }
+
+  // 1051 web是否有弹窗
+  handleWebDialog(msgData: string): void {
+    const script = 'js2native("webDialog",\'' + msgData + '\')';
+    try {
+      const promise = this.webviewCtrl.runJavaScript(script);
+      if (promise && typeof promise.then === 'function') {
+        promise.then(() => {}).catch(() => {});
+      }
+    } catch (_e) {}
+  }
+
+  // 1052 课堂记录信息
+  handleClassInfo(msgData: string): void {
+    try {
+      const jo = JSON.parse(msgData) as Record<string, string>;
+      const action = jo['action'];
+      if (action) {
+        const script = 'js2native("' + action + '",\'' + msgData + '\')';
+        try {
+          const promise = this.webviewCtrl.runJavaScript(script);
+          if (promise && typeof promise.then === 'function') {
+            promise.then(() => {}).catch(() => {});
+          }
+        } catch (_e) {}
+      }
+    } catch (e) {
+      console.warn('[XDY] handleClassInfo parse err');
+    }
+  }
+
+  // 实际执行加入频道 - 照抄Android端逻辑
+  doJoinChannel(channelId: string, uid: number, appId: string, domain: string,
+    secretKey: string, sdkType: string, channelMode: string,
+    channelKey: string, videoProfile: string, dynSub: boolean): void {
+    this.channelId = channelId;
+    this.videoDynamicSubscribe = dynSub;
+    // 同步 channelId/uid 到 DeviceLogReporter，确保日志携带正确的会话信息
+    try {
+      DeviceLogReporter.getInstance().updateSession(channelId, uid);
+    } catch (e) {
+      console.warn('[XDY] 更新 DeviceLogReporter 会话信息失败: ' + (e instanceof Error ? e.message : String(e)));
+    }
+    let rtcType: RtcType = RtcType.Agora;
+    if (sdkType === 'hrtc') { rtcType = RtcType.HRtc; }
+    else if (sdkType === 'trtc') { rtcType = RtcType.TRtc; }
+    else if (sdkType === 'yunxinrtc') { rtcType = RtcType.WRtc; }
+    
+    // 若引擎已存在（onLoadIntercept 未彻底销毁的边角情况），先销毁再重建
+    // 注意：刷新场景已在 handleJoinChannel 中提前 return，不会到达此处
+    // 每个销毁操作单独 try-catch，防止某一步失败阻断后续清理
+    if (this.rtcEngine) {
+      console.info('[XDY] doJoinChannel: RTC引擎已存在（边角情况），先销毁再重新创建');
+      try {
+        if (this.rtcHandler) {
+          this.rtcEngine.removeEventHandler(this.rtcHandler);
+          this.rtcHandler = null;
+        }
+      } catch (_e) { console.warn('[XDY] removeEventHandler 失败 ' + String(_e)); }
+      try { this.rtcEngine.leaveChannel(); } catch (_e) { console.warn('[XDY] leaveChannel 失败 ' + String(_e)); }
+      try { this.rtcEngine.destroy(); } catch (_e) { console.warn('[XDY] destroy 失败 ' + String(_e)); }
+      this.rtcEngine = null;
+      this.rtcHandler = null;
+      this.joinChanneled = false;
+    }
+
+    // 创建新引擎
+    {
+      let context: common.UIAbilityContext | null = null;
+      try {
+        context = getContext(this) as common.UIAbilityContext;
+      } catch (e) {
+        console.warn('[XDY] 获取 Context 失败: ' + (e instanceof Error ? e.message : String(e)));
+      }
+      const params: ChannelInitParams = new ChannelInitParams(appId, rtcType, domain, secretKey, context);
+      this.rtcEngine = XrtcEngine.createRtc(params);
+      if (!this.rtcEngine) { console.error('[XDY] createRtc 失败'); return; }
+      // 先移除旧 session 残留的回调（复用引擎时有效）
+      if (this.rtcHandler) { this.rtcEngine.removeEventHandler(this.rtcHandler); }
+      this.rtcHandler = new XdyRtcHandler(this);
+      this.rtcEngine.addEventHandler(this.rtcHandler);
+      let scenario: AudioScenarioType = AudioScenarioType.AUDIO_SCENARIO_DEFAULT;
+      if (channelMode === 'GameStreaming') { scenario = AudioScenarioType.AUDIO_SCENARIO_MUSIC; }
+      else if (channelMode === 'ChatRoom') { scenario = AudioScenarioType.AUDIO_SCENARIO_CHATROOM; }
+      this.rtcEngine.setAudioProfileScenario(scenario);
+      this.rtcEngine.configVideoEncoder(getVideoConfig(videoProfile));
+    }
+    
+    UserParam.getLocal().setUid(uid);
+    const userParam: UserParam = new UserParam(uid);
+    const joinRet: number = this.rtcEngine.joinChannel(userParam, channelKey, channelId);
+    if (joinRet < 0) {
+      // joinChannel 同步返回失败时（如引擎内部状态异常），清除引擎让下次 1003 重新创建
+      console.error('[XDY] joinChannel 返回失败 ret=' + joinRet + '，清除引擎等待重试');
+      try { this.rtcEngine.destroy(); } catch (_e) {}
+      this.rtcEngine = null;
+      this.joinChanneled = false;
+    }
+  }
+
+  // Native → JS 通知
+  native2Js(type: string, code: number, name: string, dataJson: string): void {
+    const msg: string = '{"type":"' + type + '","name":"' + name +
+      '","code":' + code + ',"data":' + dataJson + '}';
+    const escaped: string = msg.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    const script: string = '_native2js("nativeWebRtcAction",\'' + escaped + '\')';
+    try {
+      const promise = this.webviewCtrl.runJavaScript(script);
+      if (promise && typeof promise.then === 'function') {
+        promise.then(() => {}).catch(() => {});
+      }
+    } catch (e) {
+      console.error('[XDY] native2Js err: ' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+
+  // ===== 推流绑定视频 =====
+  pushStream(uid: number, video: boolean, audio: boolean, channelId: string, overrideRole?: string, overrideName?: string): PlayerViewInfo | null {
+    const memberInfo = this.memberMap.get(uid);
+    // 优先使用传入的角色和名称，其次使用 memberMap 中的
+    const userRole: string = overrideRole ?? (memberInfo ? memberInfo.userRole : 'normal');
+    const userName: string = overrideName ?? (memberInfo ? memberInfo.userName : '');
+    let targetPv: PlayerViewInfo | null = null;
+
+    if (uid === this.selfUid && this.rtcEngine) {
+      this.rtcEngine.switchRole(RoleType.ANCHOR);
+    }
+
+    console.info('[XDY] pushStream: uid=' + uid + ', userRole=' + userRole + ', selfUid=' + this.selfUid + ', memberInfo=' + (memberInfo ? JSON.stringify(memberInfo) : 'null'));
+
+    // 先检查是否已经绑定到某个视图
+    for (const pv of this.playerViews) {
+      if (pv.userId === uid && pv.surfaceId) {
+        console.info('[XDY] pushStream: uid=' + uid + ' 已绑定到 vid=' + pv.vid);
+        return pv;
+      }
+    }
+
+    // 优先查找匹配角色的空闲视图
+    // host -> host 视图
+    // normal -> normal 视图（优先）或 showstage 视图
+    // 注意：需要优先匹配 exact role，其次匹配兼容 role
+    
+    // 第一轮：优先找 exact match 的空闲视图
+    for (let i = 0; i < this.playerViews.length; i++) {
+      const pv = this.playerViews[i];
+      console.info('[XDY] pushStream: checking vid=' + pv.vid + ', pv.userRole=' + pv.userRole + ', isPlaying=' + pv.isPlaying + ', userId=' + pv.userId + ', surfaceId=' + (pv.surfaceId ? 'yes' : 'no'));
+      
+      // 如果视图已被其他用户占用，跳过
+      if (pv.isPlaying && pv.userId !== uid) continue;
+      
+      // 第一轮：只找 exact match
+      if (pv.userRole !== userRole) continue;
+
+      if (!pv.surfaceId) {
+        // surfaceId尚未就绪，标记uid等待绑定
+        pv.userId = uid;
+        pv.userName = userName;
+        pv.channelId = channelId;
+        pv.visible = true;
+        pv.isPlaying = true; // 标记为正在播放，等待surface就绪
+        return pv;
+      }
+
+      const surfaceId: string = pv.surfaceId;
+      if (this.rtcEngine) {
+        const up: UserParam = new UserParam(uid);
+        if (uid === this.selfUid) {
+          // enableLocalAudio 启动麦克风采集（enableAudio 仅启用音频模块，不保证本地采集）
+          this.rtcEngine.enableLocalAudio(audio);
+          this.rtcEngine.enableLocalVideo(video);
+          // setupLocalVideo 需在 enableLocalVideo 之后调用
+          this.rtcEngine.setLocalVideo(surfaceId, true, RenderMode.RENDER_MODE_HIDDEN, up);
+          // muteLocal* 控制帧数据是否发送（配合 switchRole 内的 updateChannelMediaOptions）
+          this.rtcEngine.muteLocalVideoStream(!video);
+          this.rtcEngine.muteLocalAudioStream(!audio);
+          const setupCode: number = 0; // 与Android一致，setLocalVideo始终成功返回0
+          this.native2Js('2005', setupCode >= 0 ? 0 : 1, '推流开音视频',
+            '{"uid":' + uid + ',"video":' + (video ? 'true' : 'false') +
+              ',"audio":' + (audio ? 'true' : 'false') + ',"setupVideo":' + setupCode + '}');
+        } else {
+          this.rtcEngine.setRemoteVideo(surfaceId, true, RenderMode.RENDER_MODE_HIDDEN, up);
+        }
+      }
+      pv.userId = uid;
+      pv.userName = userName;
+      pv.isPlaying = true;
+      pv.audioMuted = !audio;
+      pv.videoMuted = !video;
+      pv.channelId = channelId;
+      pv.visible = true;
+      targetPv = pv;
+      console.info('[XDY] pushStream: 绑定成功 uid=' + uid + ' -> vid=' + pv.vid + ', surfaceId=' + surfaceId);
+      break;
+    }
+    
+    // 第二轮：如果没有找到，找兼容的视图（normal 可以绑定到 showstage）
+    if (!targetPv && userRole === 'normal') {
+      console.info('[XDY] pushStream: 未找到 normal 视图，尝试绑定到 showstage 视图');
+      for (let i = 0; i < this.playerViews.length; i++) {
+        const pv = this.playerViews[i];
+        
+        // 如果视图已被其他用户占用，跳过
+        if (pv.isPlaying && pv.userId !== uid) continue;
+        
+        // 第二轮：找兼容的 showstage 视图
+        if (pv.userRole !== 'showstage') continue;
+
+        if (!pv.surfaceId) {
+          pv.userId = uid;
+          pv.userName = userName;
+          pv.channelId = channelId;
+          pv.visible = true;
+          pv.isPlaying = true; // 标记为正在播放，等待surface就绪
+          return pv;
+        }
+
+        const surfaceId: string = pv.surfaceId;
+        if (this.rtcEngine) {
+          const up: UserParam = new UserParam(uid);
+          if (uid === this.selfUid) {
+            this.rtcEngine.enableLocalAudio(audio);
+            this.rtcEngine.enableLocalVideo(video);
+            this.rtcEngine.setLocalVideo(surfaceId, true, RenderMode.RENDER_MODE_HIDDEN, up);
+            this.rtcEngine.muteLocalVideoStream(!video);
+            this.rtcEngine.muteLocalAudioStream(!audio);
+            const setupCode: number = 0;
+            this.native2Js('2005', setupCode >= 0 ? 0 : 1, '推流开音视频',
+              '{"uid":' + uid + ',"video":' + (video ? 'true' : 'false') +
+                ',"audio":' + (audio ? 'true' : 'false') + ',"setupVideo":' + setupCode + '}');
+          } else {
+            this.rtcEngine.setRemoteVideo(surfaceId, true, RenderMode.RENDER_MODE_HIDDEN, up);
+          }
+        }
+        pv.userId = uid;
+        pv.userName = userName;
+        pv.isPlaying = true;
+        pv.audioMuted = !audio;
+        pv.videoMuted = !video;
+        pv.channelId = channelId;
+        pv.visible = true;
+        targetPv = pv;
+        console.info('[XDY] pushStream: 绑定成功 uid=' + uid + ' -> vid=' + pv.vid + ' (showstage兼容), surfaceId=' + surfaceId);
+        break;
+      }
+    }
+    if (!targetPv) {
+      console.warn('[XDY] pushStream: 未找到合适视图 uid=' + uid + ', userRole=' + userRole);
+    }
+    return targetPv;
+  }
+
+  // ===== 取消推流 =====
+  cancelStream(uid: number, _channelId: string): void {
+    for (const pv of this.playerViews) {
+      if (pv.userId === uid) {
+        if (pv.surfaceId && this.rtcEngine) {
+          const up: UserParam = new UserParam(uid);
+          if (uid === this.selfUid) {
+            this.rtcEngine.enableLocalVideo(false);
+            this.rtcEngine.setLocalVideo(pv.surfaceId, false, RenderMode.RENDER_MODE_HIDDEN, up);
+          } else {
+            this.rtcEngine.setRemoteVideo(pv.surfaceId, false, RenderMode.RENDER_MODE_HIDDEN, up);
+          }
+        }
+        pv.userId = 0;
+        pv.userName = '';
+        pv.isPlaying = false;
+        pv.channelId = '';
+        pv.visible = false;
+      }
+    }
+    
+    if (uid === this.selfUid) {
+      if (this.rtcEngine) {
+        this.rtcEngine.muteLocalAudioStream(true);
+        this.rtcEngine.muteLocalVideoStream(true);
+      }
+      this.native2Js('2008', 0, '取消推流', '{"uid":' + uid + '}');
+    }
+  }
+
+  // ===== RTC 事件回调（由 XdyRtcHandler 调用）=====
+  handleJoinSuccess(channel: string, uid: UserUUID): void {
+    this.joinChanneled = true;
+    this.selfUid = uid.getUid();
+    if (this.rtcEngine) {
+      this.rtcEngine.setEnableSpeakerphone(true);
+      this.rtcEngine.adjustPlaybackVolume(100);
+    }
+    const rtcTypeStr: string = String(XrtcEngine.getRtcType() ?? 'Agora');
+    this.native2Js('2003', 0, '加入频道',
+      '{"uid":' + this.selfUid + ',"rtcType":"' + rtcTypeStr + '"}');
+    console.info('[XDY] 加入频道成功 channel=' + channel + ' uid=' + uid.getUid());
+    
+    // 回扫 memberMap：对已开摄像头/麦克风的成员主动推流（冲版情况下 joinChanneled=false 时每有校准）
+    this.memberMap.forEach((mi, membUid) => {
+      if (membUid === this.selfUid) return;
+      let found = false;
+      for (const pv of this.playerViews) {
+        if (pv.userId === membUid) { found = true; break; }
+      }
+      if (!found && (mi.openCamera > 0 || mi.openMicrophones > 0)) {
+        const userRole = mi.userRole ?? 'normal';
+        const userName = mi.userName ?? '';
+        console.info('[XDY] handleJoinSuccess: 补推流 uid=' + membUid + ', userRole=' + userRole);
+        this.pushStream(membUid, mi.openCamera > 0, mi.openMicrophones > 0, this.channelId, userRole, userName);
+      }
+    });
+  }
+
+  handleLeaveSuccess(): void {
+    // Android端: handelWebLeaveChannel已经处理了退出逻辑
+    // 如果是刷新场景、退出场景或重新加入场景，不处理
+    if (this.isRefreshing || this.isOut || this.isRejoining) {
+      console.info('[XDY] handleLeaveSuccess: 刷新、退出或重新加入场景，跳过');
+      // 重新加入场景需要重置标志
+      if (this.isRejoining) {
+        this.isRejoining = false;
+      }
+      return;
+    }
+    this.joinChanneled = false;
+    this.cancelStream(this.selfUid, this.channelId);
+    this.native2Js('3003', 0, '本地已退出频道', '{"uid":' + this.selfUid + '}');
+    console.info('[XDY] 离开频道');
+    
+    // 重置状态
+    this.channelId = '';
+    this.memberMap.clear();
+    this.rtcModelMap.clear();
+    this.remoteStatsMap.clear();
+  }
+
+  handleUserJoined(uid: UserUUID): void {
+    const uidVal: number = uid.getUid();
+    console.info('[XDY] 远端用户加入 uid=' + uidVal + ', inMemberMap=' + this.memberMap.has(uidVal));
+    // 始终记录到rtcModelMap（确保后续搜索能找到）
+    if (!this.rtcModelMap.has(uidVal)) {
+      const m: RtcModelInfo = { uid: uidVal, audioMute: 0, videoMute: 0 };
+      this.rtcModelMap.set(uidVal, m);
+    }
+    // 如果该UID不在memberMap中且屏幕共享待订阅，自动订阅为屏幕共享
+    if (this.screenSharePending && !this.memberMap.has(uidVal) && uidVal !== this.selfUid) {
+      console.info('[XDY] handleUserJoined: 检测到屏幕共享UID=' + uidVal + '，自动订阅');
+      this.subscribeScreenShare(uidVal);
+    }
+  }
+
+  handleUserOffline(uid: UserUUID, reason: number): void {
+    const uidVal: number = uid.getUid();
+    console.info('[XDY] 远端用户离线 uid=' + uidVal + ' reason=' + reason);
+    if (uidVal === this.selfUid) return;
+    const mi = this.memberMap.get(uidVal);
+    if (mi) { mi.audioMuted = true; mi.videoMuted = true; this.memberMap.set(uidVal, mi); }
+    this.rtcModelMap.delete(uidVal);
+    this.native2Js('2004', 0, '远端退出频道', '{"uid":' + uidVal + '}');
+    this.cancelStream(uidVal, this.channelId);
+  }
+
+  handleFirstRemoteVideo(uid: UserUUID): void {
+    const uidVal: number = uid.getUid();
+    if (uidVal === this.selfUid) return;
+    console.info('[XDY] 远端首帧视频 uid=' + uidVal);
+    let model = this.rtcModelMap.get(uidVal);
+    const memberInfo = this.memberMap.get(uidVal);
+    if (!memberInfo) {
+      if (!model) {
+        const m: RtcModelInfo = { uid: uidVal, audioMute: 0, videoMute: 0 };
+        this.rtcModelMap.set(uidVal, m);
+      } else {
+        model.videoMute = 0; model.audioMute = 0;
+      }
+      // 检查是否为待订阅的屏幕共享流
+      if (this.screenSharePending && uidVal !== this.selfUid) {
+        console.info('[XDY] handleFirstRemoteVideo: 检测到屏幕共享UID=' + uidVal + '，自动订阅');
+        this.subscribeScreenShare(uidVal);
+      }
+      return;
+    }
+    if (model) {
+      model.videoMute = 0; model.audioMute = 0;
+      const userRole = memberInfo.userRole ?? 'normal';
+      const userName = memberInfo.userName ?? '';
+      this.pushStream(uidVal, true, true, this.channelId, userRole, userName);
+    } else {
+      const m: RtcModelInfo = { uid: uidVal, audioMute: 0, videoMute: 0 };
+      this.rtcModelMap.set(uidVal, m);
+      const userRole = memberInfo.userRole ?? 'normal';
+      const userName = memberInfo.userName ?? '';
+      this.pushStream(uidVal, true, true, this.channelId, userRole, userName);
+    }
+  }
+
+  handleFirstRemoteAudio(uid: UserUUID): void {
+    const uidVal: number = uid.getUid();
+    if (uidVal === this.selfUid) return;
+    console.info('[XDY] 远端首帧音频 uid=' + uidVal);
+    let model = this.rtcModelMap.get(uidVal);
+    const memberInfo = this.memberMap.get(uidVal);
+    if (!memberInfo) {
+      if (!model) {
+        const m: RtcModelInfo = { uid: uidVal, audioMute: 0, videoMute: 1 };
+        this.rtcModelMap.set(uidVal, m);
+      } else {
+        model.audioMute = 0;
+      }
+      return;
+    }
+    if (model) {
+      model.audioMute = 0;
+      const userRole = memberInfo.userRole ?? 'normal';
+      const userName = memberInfo.userName ?? '';
+      this.pushStream(uidVal, model.videoMute === 0, true, this.channelId, userRole, userName);
+    } else {
+      const m: RtcModelInfo = { uid: uidVal, audioMute: 0, videoMute: 1 };
+      this.rtcModelMap.set(uidVal, m);
+      const userRole = memberInfo.userRole ?? 'normal';
+      const userName = memberInfo.userName ?? '';
+      this.pushStream(uidVal, false, true, this.channelId, userRole, userName);
+    }
+  }
+
+  handleUserMuteAudio(uid: UserUUID, muted: boolean): void {
+    const uidVal: number = uid.getUid();
+    if (uidVal === this.selfUid) return;
+    const model = this.rtcModelMap.get(uidVal);
+    if (model) { model.audioMute = muted ? 1 : 0; }
+    const mi = this.memberMap.get(uidVal);
+    if (mi) { mi.audioMuted = muted; this.memberMap.set(uidVal, mi); }
+    // 同步到playerView以驱动图标状态
+    for (const pv of this.playerViews) {
+      if (pv.userId === uidVal) { pv.audioMuted = muted; }
+    }
+    // 通知H5远端音频静音状态
+    this.native2Js('2007', 0, muted ? '远端关闭音频' : '远端开启音频',
+      '{"uid":' + uidVal + ',"mute":' + (muted ? 'true' : 'false') + '}');
+  }
+
+  handleUserMuteVideo(uid: UserUUID, muted: boolean): void {
+    const uidVal: number = uid.getUid();
+    if (uidVal === this.selfUid) return;
+    console.info('[XDY] handleUserMuteVideo: uid=' + uidVal + ', muted=' + muted);
+    const model = this.rtcModelMap.get(uidVal);
+    if (model) { model.videoMute = muted ? 1 : 0; }
+    const mi = this.memberMap.get(uidVal);
+    if (mi) { mi.videoMuted = muted; this.memberMap.set(uidVal, mi); }
+    // 通知H5远端视频静音状态（H5根据此状态显示麦克风/摄像头图标）
+    this.native2Js('2006', 0, muted ? '远端关闭视频' : '远端开启视频',
+      '{"uid":' + uidVal + ',"mute":' + (muted ? 'true' : 'false') + '}');
+    // 控制远端视图状态
+    if (this.rtcEngine) {
+      const up: UserParam = new UserParam(uidVal);
+      for (const pv of this.playerViews) {
+        if (pv.userId === uidVal) {
+          pv.videoMuted = muted;
+          if (muted) {
+            this.rtcEngine.setRemoteVideo(pv.surfaceId, false, RenderMode.RENDER_MODE_HIDDEN, up);
+            // 保持visible=true（显示黑底+麦克风图标），不让H5摄像头图标透出
+          } else {
+            this.rtcEngine.setRemoteVideo(pv.surfaceId, true, RenderMode.RENDER_MODE_HIDDEN, up);
+            pv.visible = true;
+          }
+        }
+      }
+    }
+  }
+
+  handleConnStateChange(state: ConnStateType): void {
+    if (state === ConnStateType.DISCONNECTED) {
+      this.native2Js('3003', 0, 'RTC断线', '{"message":"rtcEngine onConnectionLost"}');
+    }
+    console.info('[XDY] 连接状态变化: ' + state);
+  }
+
+  handleVideoStats(local: LocalVideoStats | null, remote: RemoteVideoStats | null): void {
+    if (local) {
+      this.localStats.videoSendResolutionWidth = local.getEncodedBitrate();
+      this.localStats.videoSendResolutionHeight = local.getEncodedFrameHeight();
+      this.localStats.videoSendFrameRate = local.getSentFrameRate();
+      const now: number = local.getSentBitrate() * 2 / 8 * 1024;
+      this.localVideoBytes += now;
+      this.localStats.videoSendBytesNow = now;
+      this.localStats.videoSendBytes = this.localVideoBytes;
+      this.localStatsVideoReady = true;
+      if (this.localStatsAudioReady) {
+        this.localStatsAudioReady = false; this.localStatsVideoReady = false;
+        this.localStats.uid = this.selfUid;
+        this.native2Js('3001', 0, '推流视频数据', JSON.stringify(this.localStats));
+      }
+    }
+    if (remote) {
+      const rUid: number = remote.getUid();
+      let rs = this.remoteStatsMap.get(rUid);
+      if (!rs) {
+        rs = {
+          uid: rUid, endToEndDelay: 0, audioTotalActiveTime: 0,
+          audioReceivePacketsLost: 0, audioReceiveBytesNow: 0, audioReceiveBytes: 0,
+          videoReceiveResolutionWidth: 0, videoReceiveResolutionHeight: 0,
+          videoReceiveDecodeFrameRate: 0, videoReceiveBytesNow: 0, videoReceiveBytes: 0,
+          isAudio: false, isVideo: false,
+        };
+        this.remoteStatsMap.set(rUid, rs);
+      }
+      const vNow: number = remote.getReceivedBitrate() * 2 / 8 * 1024;
+      rs.videoReceiveResolutionWidth = remote.getWidth();
+      rs.videoReceiveResolutionHeight = remote.getHeight();
+      rs.videoReceiveDecodeFrameRate = remote.getDecoderOutputFrameRate();
+      rs.videoReceiveBytesNow = vNow;
+      rs.videoReceiveBytes += vNow;
+      rs.isVideo = true;
+      if (rs.isAudio) {
+        rs.isAudio = false; rs.isVideo = false;
+        this.native2Js('3002', 0, '远端视频数据', JSON.stringify(rs));
+      }
+    }
+  }
+
+  handleAudioStats(local: LocalAudioStats | null, remote: RemoteAudioStats | null): void {
+    if (local) {
+      const now: number = local.getSentBitrate() * 2 / 8 * 1024;
+      this.localAudioBytes += now;
+      this.localStats.audiosentSampleRate = local.getSentSampleRate();
+      this.localStats.audioSendBytesNow = now;
+      this.localStats.audioSendBytes = this.localAudioBytes;
+      this.localStatsAudioReady = true;
+      if (this.localStatsVideoReady) {
+        this.localStatsAudioReady = false; this.localStatsVideoReady = false;
+        this.localStats.uid = this.selfUid;
+        this.native2Js('3001', 0, '推流视频数据', JSON.stringify(this.localStats));
+      }
+    }
+    if (remote) {
+      const rUid: number = remote.getUid();
+      let rs = this.remoteStatsMap.get(rUid);
+      if (!rs) {
+        rs = {
+          uid: rUid, endToEndDelay: 0, audioTotalActiveTime: 0,
+          audioReceivePacketsLost: 0, audioReceiveBytesNow: 0, audioReceiveBytes: 0,
+          videoReceiveResolutionWidth: 0, videoReceiveResolutionHeight: 0,
+          videoReceiveDecodeFrameRate: 0, videoReceiveBytesNow: 0, videoReceiveBytes: 0,
+          isAudio: false, isVideo: false,
+        };
+        this.remoteStatsMap.set(rUid, rs);
+      }
+      const aNow: number = remote.getReceivedBitrate() * 2 / 8 * 1024;
+      rs.endToEndDelay = remote.getNetworkTransportDelay();
+      rs.audioTotalActiveTime = remote.getTotalActiveTime();
+      rs.audioReceivePacketsLost = remote.getAudioLossRate();
+      rs.audioReceiveBytesNow = aNow;
+      rs.audioReceiveBytes += aNow;
+      rs.isAudio = true;
+      if (rs.isVideo) {
+        rs.isAudio = false; rs.isVideo = false;
+        this.native2Js('3002', 0, '远端视频数据', JSON.stringify(rs));
+      }
+    }
+  }
+
+  handleRtcError(error: TipInfo): void {
+    this.native2Js('3003', 0, 'RTC错误',
+      '{"uid":' + this.selfUid + ',"code":' + error.getCode() + ',"message":"rtcEngine onError"}');
+    console.error('[XDY] RTC错误 code=' + error.getCode());
+  }
+
+  // ===== 辅助方法 =====
+  onSurfaceReady(vid: string, surfaceId: string): void {
+    console.info('[XDY] onSurfaceReady triggered for vid=' + vid + ', surfaceId=' + surfaceId);
+    // 找到对应 playerView 存储 surfaceId
+    const pv = this.playerViews.find((pv: PlayerViewInfo) => pv.vid === vid);
+    if (!pv) return;
+    
+    pv.surfaceId = surfaceId;
+    
+    // 若已有待绑定的uid，立即绑定视频
+    if (pv.userId > 0 && this.rtcEngine) {
+      const up: UserParam = new UserParam(pv.userId);
+      if (pv.userId === this.selfUid) {
+        this.rtcEngine.setLocalVideo(surfaceId, true, RenderMode.RENDER_MODE_HIDDEN, up);
+      } else {
+        this.rtcEngine.setRemoteVideo(surfaceId, true, RenderMode.RENDER_MODE_HIDDEN, up);
+      }
+      pv.isPlaying = true;
+      pv.visible = true;
+    }
+    console.info('[XDY] onSurfaceReady: 绑定视频完成 vid=' + vid + ', uid=' + pv.userId + ', surfaceId=' + surfaceId);
+  }
+
+  getPlayerViewByUid(uid: number): PlayerViewInfo | null {
+    return this.playerViews.find((pv: PlayerViewInfo) => pv.userId === uid) ?? null;
+  }
+}

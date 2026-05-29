@@ -1,0 +1,10 @@
+{
+  "module": {
+    "name": "classroom",
+    "type": "har",
+    "deviceTypes": [
+      "phone",
+      "tablet"
+    ]
+  }
+}

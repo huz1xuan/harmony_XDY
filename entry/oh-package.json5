@@ -6,7 +6,6 @@
   "author": "",
   "license": "",
   "dependencies": {
-    "@av/xrtc": "file:../libs/xrtc.har"
+    "@xdy/classroom": "file:../classroom"
   }
 }
-
