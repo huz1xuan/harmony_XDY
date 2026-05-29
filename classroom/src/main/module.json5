@@ -5,6 +5,16 @@
     "deviceTypes": [
       "phone",
       "tablet"
+    ],
+    "abilities": [
+      {
+        "name": "XDYClassroomAbility",
+        "srcEntry": "./ets/XDYClassroomAbility.ets",
+        "startWindowIcon": "$media:icon",
+        "startWindowBackground": "$color:white",
+        "orientation": "landscape",
+        "launchType": "standard"
+      }
     ]
   }
 }

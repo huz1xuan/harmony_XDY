@@ -6,6 +6,6 @@
   "author": "",
   "license": "",
   "dependencies": {
-    "@xdy/classroom": "file:../classroom"
+    "@xdy/classroom": "file:./libs/classroom.har"
   }
 }

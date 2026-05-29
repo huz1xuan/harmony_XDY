@@ -39,14 +39,6 @@
             ]
           }
         ]
-      },
-      {
-        "name": "XDYClassroomAbility",
-        "srcEntry": "./ets/entryability/XDYClassroomAbility.ets",
-        "startWindowIcon": "$media:logo",
-        "startWindowBackground": "$color:start_window_background",
-        "orientation": "landscape",
-        "launchType": "standard"
       }
     ],
     "extensionAbilities": [

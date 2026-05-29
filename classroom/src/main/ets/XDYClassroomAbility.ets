@@ -13,8 +13,10 @@ export default class XDYClassroomAbility extends UIAbility {
 
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, 'XDYClassroom', 'XDYClassroomAbility onCreate');
-    // 从 Want 中取出课堂 URL，存入 LocalStorage 供页面读取
-    const url = want.parameters?.classroomUrl as string ?? '';
+    // 从 Want 参数或 AppStorage 中取出课堂 URL
+    const url = (want.parameters?.classroomUrl as string)
+      ?? AppStorage.get<string>('xdy_classroom_url')
+      ?? '';
     this.storage.setOrCreate('classroomUrl', url);
     hilog.info(DOMAIN, 'XDYClassroom', 'Classroom URL: %{public}s', url);
   }
