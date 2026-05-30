@@ -52,7 +52,7 @@ const PREF_CACHED_LOGS = 'cached_logs';
 const MAX_CACHE_SIZE = 100;
 const COLLECT_INTERVAL_MS = 30 * 1000;       // 30秒采集一次动态信息
 const REPORT_INTERVAL_MS = 10 * 60 * 1000;   // 10分钟上报一次
-const UPLOAD_URL = 'http://log3.xuedianyun.com/uploadLog';
+const UPLOAD_URL = 'https://log.xuedianyun.com/h5/';
 
 export class DeviceLogReporter {
   private static instance: DeviceLogReporter | null = null;
@@ -149,8 +149,20 @@ export class DeviceLogReporter {
 
   /** 更新频道和用户信息 */
   updateSession(channelId: string, uid: number): void {
+    const hadSession = this.channelId.length > 0 && this.uid > 0;
     this.channelId = channelId;
     this.uid = uid;
+    // 首次获得会话时触发补报（对齐 Android DeviceMonitor.notifyUserLogin 行为）
+    // 必须确保 prefs 已就绪，否则 start() 恢复后会自动重试
+    if (!hadSession && channelId.length > 0 && uid > 0) {
+      if (this.prefs !== null) {
+        console.info(TAG + ' 首次获得会话(channelId=' + channelId + ', uid=' + uid + ')，触发补报');
+        this.reportStaticInfoIfNeeded();
+        this.retryCachedLogs();
+      } else {
+        console.info(TAG + ' 首次获得会话但 prefs 未就绪，等待 start() 完成后自动补报');
+      }
+    }
   }
 
   /** 通知前后台切换 */
@@ -173,14 +185,15 @@ export class DeviceLogReporter {
         }
       }
       const staticInfo = this.collectStaticInfo();
+      const ts = this.formatTimestamp(Date.now());
       const logEntry: LogEntry = {
-        timestamp: this.formatTimestamp(Date.now()),
+        timestamp: ts,
         logType: 'device_info',
         platform: 'harmony',
         staticInfo: staticInfo
       };
       const logJson = JSON.stringify(logEntry);
-      const success = await this.uploadLog(logJson);
+      const success = await this.uploadLog(logJson, ts);
       if (success && this.prefs) {
         await this.prefs.put(PREF_STATIC_REPORTED, true);
         await this.prefs.flush();
@@ -301,13 +314,14 @@ export class DeviceLogReporter {
 
     // 取最后一条作为代表性快照上报
     const latest = buffered[buffered.length - 1];
+    const ts = this.formatTimestamp(Date.now());
     const logEntry: LogEntry = {
-      timestamp: this.formatTimestamp(Date.now()),
+      timestamp: ts,
       logType: 'device_info',
       platform: 'harmony',
       dynamicInfo: latest
     };
-    const success = await this.uploadLog(JSON.stringify(logEntry));
+    const success = await this.uploadLog(JSON.stringify(logEntry), ts);
     if (!success) {
       await this.cacheLog(JSON.stringify(logEntry));
     }
@@ -316,15 +330,16 @@ export class DeviceLogReporter {
   // ===== 异常事件即时上报 =====
   private async reportEvent(eventType: string, dynInfo?: DynamicInfo): Promise<void> {
     try {
+      const ts = this.formatTimestamp(Date.now());
       const logEntry: LogEntry = {
-        timestamp: this.formatTimestamp(Date.now()),
+        timestamp: ts,
         logType: 'event',
         platform: 'harmony',
         dynamicInfo: dynInfo ?? this.getDynamicSnapshot(),
         eventType: eventType
       };
       const logJson = JSON.stringify(logEntry);
-      const success = await this.uploadLog(logJson);
+      const success = await this.uploadLog(logJson, ts);
       if (!success) {
         await this.cacheLog(logJson);
       }
@@ -354,56 +369,62 @@ export class DeviceLogReporter {
   }
 
   // ===== 上报 =====
-  private async uploadLog(logJson: string): Promise<boolean> {
-    try {
-      const model = deviceInfo.productModel ?? 'HarmonyOS';
-      const fileName = model + '_' + this.uid + '_HarmonyOS.log';
-      const ts = Date.now().toString();
+  private async uploadLog(logJson: string, originalTimestamp?: string): Promise<boolean> {
+    // 守卫：未设置会话信息时跳过，保留缓存等待补报（对齐Android DeviceMonitor行为）
+    if (this.uid <= 0 || this.channelId.length === 0) {
+      console.info(TAG + ' 跳过上报: uid=' + this.uid + ', channelId=' + this.channelId + ' 未就绪，保留缓存');
+      return false;
+    }
 
-      // 构建 multipart/form-data body
-      const boundary = '----XdyLogBoundary' + ts;
-      let body = '';
-      // key 参数
-      body += '--' + boundary + '\r\n';
-      body += 'Content-Disposition: form-data; name="key"\r\n\r\n';
-      body += 'xdyharmonylog\r\n';
-      // channelId
-      body += '--' + boundary + '\r\n';
-      body += 'Content-Disposition: form-data; name="channelId"\r\n\r\n';
-      body += this.channelId + '\r\n';
-      // uid
-      body += '--' + boundary + '\r\n';
-      body += 'Content-Disposition: form-data; name="uid"\r\n\r\n';
-      body += this.uid.toString() + '\r\n';
-      // timestamp
-      body += '--' + boundary + '\r\n';
-      body += 'Content-Disposition: form-data; name="timestamp"\r\n\r\n';
-      body += ts + '\r\n';
-      // 日志文件
-      body += '--' + boundary + '\r\n';
-      body += 'Content-Disposition: form-data; name="file"; filename="' + fileName + '"\r\n';
-      body += 'Content-Type: application/octet-stream\r\n\r\n';
-      body += logJson + '\r\n';
-      body += '--' + boundary + '--\r\n';
+    try {
+      const nodeId = (deviceInfo.productModel ?? 'HarmonyOS').replace(/ /g, '_');
+
+      // 手动构建 form-urlencoded body（不用 Object 避免 ArkTS 序列化差异）
+      const body = 'classId=' + encodeURIComponent(this.channelId) +
+        '&type=1' +
+        '&userId=' + encodeURIComponent(this.uid.toString()) +
+        '&nodeId=' + encodeURIComponent(nodeId) +
+        '&data=' + encodeURIComponent(logJson) +
+        (originalTimestamp ? '&timestamp=' + encodeURIComponent(originalTimestamp) : '');
+
+      console.info(TAG + ' 开始上报: classId=' + this.channelId + ', userId=' + this.uid +
+        ', data长度=' + logJson.length + ', body长度=' + body.length);
 
       const httpRequest = http.createHttp();
       const response = await httpRequest.request(UPLOAD_URL, {
         method: http.RequestMethod.POST,
         header: {
-          'Content-Type': 'multipart/form-data; boundary=' + boundary
+          'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8'
         },
         extraData: body
       });
-      httpRequest.destroy();
 
       const code = response.responseCode;
+      let respBody = '';
+      try {
+        if (typeof response.result === 'string') {
+          respBody = response.result as string;
+        } else if (typeof response.result === 'object') {
+          respBody = JSON.stringify(response.result);
+        }
+      } catch (_re) {
+        respBody = '(无法读取响应体)';
+      }
+
+      httpRequest.destroy();
+
       if (code >= 200 && code < 300) {
+        console.info(TAG + ' 上报成功: code=' + code + ', body=' + respBody);
         return true;
       }
-      console.warn(TAG + ' 上报HTTP响应码: ' + code);
+      console.warn(TAG + ' 上报失败: code=' + code + ', body=' + respBody);
       return false;
     } catch (e) {
-      console.error(TAG + ' 上报网络异常: ' + (e instanceof Error ? e.message : String(e)));
+      // ArkTS BusinessError 不一定是 Error 子类，用括号记法安全取值
+      const err = e as Record<string, Object>;
+      const errCode = err['code'] ?? '?';
+      const errMsg = err['message'] ?? '?';
+      console.error(TAG + ' 上报网络异常: code=' + errCode + ', message=' + errMsg);
       return false;
     }
   }
@@ -426,6 +447,8 @@ export class DeviceLogReporter {
 
   private async doCacheLog(logJson: string): Promise<void> {
     if (!this.prefs) {
+      console.error(TAG + ' Preferences未就绪，缓存失败（数据丢失!），logJson前100字符: ' +
+        (logJson.length > 100 ? logJson.substring(0, 100) + '...' : logJson));
       return;
     }
     try {
