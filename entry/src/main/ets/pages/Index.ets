@@ -1,5 +1,6 @@
 import { ClassroomView, XDYClassroom } from '@xdy/classroom';
 import { common } from '@kit.AbilityKit';
+import { promptAction } from '@kit.ArkUI';
 
 const TEST_URL = '';
 // 为空则进入学点云默认登录页面，填入有效 URL 则直接进入课堂，注意不能直接注释掉
@@ -12,6 +13,15 @@ localStorage.setOrCreate('classroomUrl', TEST_URL);
 struct Index {
   @State showEmbedded: boolean = false;
   @State urlInput: string = TEST_URL;
+
+  aboutToAppear(): void {
+    XDYClassroom.onLoaded(() => {
+      promptAction.showToast({ message: '（XDYClassroom.onLoaded）课堂加载完成', duration: 2000 });
+    });
+    XDYClassroom.onClosed(() => {
+      promptAction.showToast({ message: '（XDYClassroom.onClosed）课堂已退出', duration: 2000 });
+    });
+  }
 
   build() {
     if (this.showEmbedded) {

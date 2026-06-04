@@ -6,6 +6,7 @@ import bundleManager from '@ohos.bundle.bundleManager';
 import { deviceInfo } from '@kit.BasicServicesKit';
 import { audio } from '@kit.AudioKit';
 import { DeviceLogReporter } from '../utils/DeviceLogReporter';
+import { XDYClassroom } from '../XDYClassroom';
 import {
   XrtcEngine, IEngineEventHandler, UserParam, UserUUID, TipInfo,
   LocalAudioStats, RemoteAudioStats, LocalVideoStats, RemoteVideoStats,
@@ -384,6 +385,7 @@ export struct ClassroomView {
                 this.rtcEngine = null;
               }
               this.reset();
+              XDYClassroom._triggerClosed();
               console.info('[XDY] onLoadIntercept: RTC引擎已销毁，视图已清空');
             }
             try {
@@ -456,6 +458,7 @@ export struct ClassroomView {
         this.rtcEngine = null;
       }
       this.reset();
+      XDYClassroom._triggerClosed();
       try {
         webview.WebCookieManager.clearAllCookiesSync();
         this.webviewCtrl.runJavaScript('try{localStorage.clear();sessionStorage.clear();}catch(e){}');
@@ -548,6 +551,7 @@ export struct ClassroomView {
     // 收到 1000 initNativeApp 消息代表 H5 已重新加载，必须重置 isOut 确保后续加入频道不被拦截
     this.isOut = false;
     this.native2Js('2000', 0, '加载webview', '{"os":"android"}');
+    XDYClassroom._triggerLoaded();
     // H5 应用层已就绪，注入屏幕共享 API Hook
     this.injectScreenShareHook();
   }
@@ -791,9 +795,10 @@ export struct ClassroomView {
     
     // 调用reset清空视图和数据
     this.reset();
-    
+    XDYClassroom._triggerClosed();
+
     console.info('[XDY] handleLeaveChannel: RTC已销毁，视频视图已清空');
-    
+
     // 清除session并重载登录页
     try {
       webview.WebCookieManager.clearAllCookiesSync();

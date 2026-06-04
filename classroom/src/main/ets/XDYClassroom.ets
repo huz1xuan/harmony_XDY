@@ -5,6 +5,13 @@ import { common, Want } from '@kit.AbilityKit';
  * 客户通过该类启动课堂
  */
 export class XDYClassroom {
+  private static onLoadedCb?: () => void;
+  private static onClosedCb?: () => void;
+
+  static onLoaded(cb: () => void): void { XDYClassroom.onLoadedCb = cb; }
+  static onClosed(cb: () => void): void { XDYClassroom.onClosedCb = cb; }
+  static _triggerLoaded(): void { XDYClassroom.onLoadedCb?.(); }
+  static _triggerClosed(): void { XDYClassroom.onClosedCb?.(); }
   /**
    * 启动课堂（新 UIAbility，独立窗口，横屏全屏）
    * @param context - 调用方的 UIAbilityContext
